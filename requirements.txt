@@ -1,0 +1,26 @@
+# installed manually via the --index-url command above.
+torch>=2.6.0
+torchvision>=0.21.0
+ 
+# -- YOLOv8 + BoT-SORT tracker ------------------------------------
+ultralytics>=8.2.0
+ 
+# -- Computer vision ----------------------------------------------
+opencv-python>=4.9.0
+numpy>=1.26.0
+ 
+# -- Monocular Depth (Depth Anything V2 - HuggingFace) ------------
+transformers>=4.40.0
+accelerate>=0.27.0
+huggingface-hub>=0.22.0
+ 
+# -- Data & utilities ---------------------------------------------
+pandas>=2.1.0
+scipy>=1.11.0
+matplotlib>=3.8.0
+tqdm>=4.66.0
+gdown>=5.1.0
+
+
+
+

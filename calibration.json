@@ -1,0 +1,24 @@
+{
+    "line_A": [
+        [
+            1097,
+            636
+        ],
+        [
+            3,
+            636
+        ]
+    ],
+    "line_B": [
+        [
+            1425,
+            129
+        ],
+        [
+            -325,
+            129
+        ]
+    ],
+    "real_distance": 40.0,
+    "video_reference": "temp_calibration_video.mp4"
+}
