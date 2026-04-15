@@ -10,9 +10,9 @@ opencv-python>=4.9.0
 numpy>=1.26.0
  
 # -- Monocular Depth (Depth Anything V2 - HuggingFace) ------------
-transformers>=4.40.0
-accelerate>=0.27.0
-huggingface-hub>=0.22.0
+#transformers>=4.40.0
+#accelerate>=0.27.0
+#huggingface-hub>=0.22.0
  
 # -- Data & utilities ---------------------------------------------
 pandas>=2.1.0

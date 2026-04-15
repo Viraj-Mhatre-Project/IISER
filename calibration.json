@@ -1,24 +1,24 @@
 {
     "line_A": [
         [
-            1097,
-            636
+            1052,
+            769
         ],
         [
-            3,
-            636
+            12,
+            769
         ]
     ],
     "line_B": [
         [
-            1425,
-            129
+            1052,
+            244
         ],
         [
-            -325,
-            129
+            12,
+            244
         ]
     ],
-    "real_distance": 40.0,
-    "video_reference": "temp_calibration_video.mp4"
+    "real_distance": 31.7,
+    "video_reference": "Video8.mp4"
 }
