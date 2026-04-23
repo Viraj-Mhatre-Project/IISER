@@ -1,4 +1,4 @@
-# SpeedSense AI — Vehicle Speed Detection System
+# IISER — Vehicle Speed Detection System
 
 A **production-ready, full-stack vehicle speed estimation system** that measures real-world vehicle speeds (km/h) from traffic videos using a **ROI line-crossing method** with optional **perspective homography correction**. Built with a **FastAPI** backend and a **React + Vite** dashboard.
 
