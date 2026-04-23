@@ -2,12 +2,18 @@ import cv2
 import json
 import math
 import os
+import numpy as np
 import gdown
+
+
+# ─────────────────────────────────────────────
+#  Helpers
+# ─────────────────────────────────────────────
 
 def download_from_drive(link):
     if "drive.google.com" not in link:
         return link
-        
+
     print("\nDownloading video from Google Drive...")
     try:
         file_id = link.split("/d/")[1].split("/")[0]
@@ -17,105 +23,241 @@ def download_from_drive(link):
 
     download_url = f"https://drive.google.com/uc?id={file_id}"
     output_path = "temp_calibration_video.mp4"
-
     gdown.download(download_url, output_path, quiet=False)
-    
     print("Download complete!\n")
     return output_path
 
-points = []
-snap_mode = True
-mouse_pos = [0, 0]
 
-def snap(ax, ay, bx, by):
-    dx = abs(bx - ax)
-    dy = abs(by - ay)
-    if dx >= dy:
+def snap_point(ax, ay, bx, by):
+    """Snap second point to the dominant axis of the first."""
+    if abs(bx - ax) >= abs(by - ay):
         return (bx, ay)
-    else:
-        return (ax, by)
+    return (ax, by)
 
-def select_points(event, x, y, flags, param):
-    global points, mouse_pos
-    mouse_pos = [x, y]
-    if event == cv2.EVENT_LBUTTONDOWN and len(points) < 2:
-        if snap_mode and len(points) == 1:
-            sx, sy = snap(points[0][0], points[0][1], x, y)
-            points.append((sx, sy))
-        else:
-            points.append((x, y))
-        print(f"  Point {len(points)}: {points[-1]}")
 
-def run_calibration(video_path):
-    global points, snap_mode, mouse_pos
-    
-    cap = cv2.VideoCapture(video_path)
-    ret, frame = cap.read()
-    if not ret:
-        print("Error reading video for calibration.")
-        return False
-        
-    cv2.namedWindow("Calibration", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Calibration", 1000, 700)
-    cv2.setMouseCallback("Calibration", select_points)
+def order_quadrilateral(pts):
+    """
+    Given 4 (x, y) points in any order, return them as
+    [top-left, top-right, bottom-right, bottom-left].
 
-    print("\nLine drawing mode:")
-    print("  1 -> Straight lines only (snaps to horizontal or vertical)")
-    print("  2 -> Free lines (place points anywhere)")
+    Strategy: split into top-2 / bottom-2 by Y, then sort each pair by X.
+    This is robust to flat/wide quads where the sum/diff trick breaks.
+    """
+    pts = np.array(pts, dtype="float32")
+    by_y       = pts[np.argsort(pts[:, 1])]   # sort top→bottom
+    top_two    = by_y[:2]
+    bottom_two = by_y[2:]
+    tl, tr = top_two[np.argsort(top_two[:, 0])]        # left→right in top pair
+    bl, br = bottom_two[np.argsort(bottom_two[:, 0])]   # left→right in bottom pair
+    return np.array([tl, tr, br, bl], dtype="float32")
+
+
+def compute_homography(src_pts_ordered, dst_width, dst_height):
+    """
+    Build the 3×3 perspective-transform matrix that maps
+    the ordered quad → a dst_width × dst_height rectangle.
+    """
+    dst = np.array([
+        [0,           0],
+        [dst_width-1, 0],
+        [dst_width-1, dst_height-1],
+        [0,           dst_height-1],
+    ], dtype="float32")
+    H, _ = cv2.findHomography(src_pts_ordered, dst)
+    return H
+
+
+def warp_frame(frame, H, dst_w, dst_h):
+    return cv2.warpPerspective(frame, H, (dst_w, dst_h))
+
+
+# ─────────────────────────────────────────────
+#  Phase 1 – Mark 4 road-corner points
+# ─────────────────────────────────────────────
+
+CORNER_LABELS  = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
+CORNER_COLORS  = [(0, 255, 255), (0, 165, 255), (0, 0, 255), (255, 0, 0)]
+
+quad_points  = []
+mouse_pos_p1 = [0, 0]
+
+
+def _cb_quad(event, x, y, flags, param):
+    global quad_points, mouse_pos_p1
+    mouse_pos_p1 = [x, y]
+    if event == cv2.EVENT_LBUTTONDOWN and len(quad_points) < 4:
+        quad_points.append((x, y))
+        print(f"  Corner {len(quad_points)} ({CORNER_LABELS[len(quad_points)-1]}): {quad_points[-1]}")
+
+
+def phase1_mark_quad(frame):
+    """Let user click 4 road-corners; returns ordered numpy array."""
+    global quad_points, mouse_pos_p1
+    quad_points = []
+
+    cv2.namedWindow("Calibration – Step 1: Road Corners", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Calibration – Step 1: Road Corners", 1000, 700)
+    cv2.setMouseCallback("Calibration – Step 1: Road Corners", _cb_quad)
+
+    print("\n── STEP 1: Mark the 4 road corners ──────────────────────────")
+    print("  Click the 4 corners of the road region in order:")
+    print("    1 → Top-Left   2 → Top-Right")
+    print("    3 → Bottom-Right  4 → Bottom-Left")
+    print("  Press ENTER to confirm once all 4 points are placed.")
+    print("  Press R to reset points.\n")
+
     while True:
-        mode_input = input("Choose mode [1/2]: ").strip()
+        disp = frame.copy()
+        n = len(quad_points)
+
+        # Draw completed polygon edges
+        for i in range(n):
+            j = (i + 1) % n
+            if j < n:
+                cv2.line(disp, quad_points[i], quad_points[j], (200, 200, 200), 1)
+
+        # Rubber-band line from last point to cursor
+        if 0 < n < 4:
+            cv2.line(disp, quad_points[-1], tuple(mouse_pos_p1), (200, 200, 200), 1)
+
+        # Close the quad preview when 4 points are set
+        if n == 4:
+            pts_np = np.array(quad_points, dtype=np.int32)
+            cv2.polylines(disp, [pts_np], isClosed=True, color=(0, 255, 0), thickness=2)
+            # Semi-transparent fill
+            overlay = disp.copy()
+            cv2.fillPoly(overlay, [pts_np], (0, 255, 0))
+            cv2.addWeighted(overlay, 0.15, disp, 0.85, 0, disp)
+
+        # Draw individual point markers
+        for i, p in enumerate(quad_points):
+            cv2.circle(disp, p, 7, CORNER_COLORS[i], -1)
+            cv2.putText(disp, f"{i+1}:{CORNER_LABELS[i]}", (p[0]+10, p[1]-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, CORNER_COLORS[i], 2)
+
+        # Next-point hint
+        if n < 4:
+            hint = f"Click point {n+1}: {CORNER_LABELS[n]}"
+        else:
+            hint = "4 points set – press ENTER to confirm  |  R to reset"
+        cv2.putText(disp, hint, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        cv2.imshow("Calibration – Step 1: Road Corners", disp)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == 13 and n == 4:          # ENTER
+            break
+        elif key in (ord('r'), ord('R')):  # Reset
+            quad_points = []
+            print("  Points reset.\n")
+        elif key == 27:                    # ESC – abort
+            cv2.destroyAllWindows()
+            return None
+
+    cv2.destroyAllWindows()
+
+    # Re-order to [TL, TR, BR, BL]
+    ordered = order_quadrilateral(quad_points)
+    print(f"\n  Ordered corners: {ordered.tolist()}")
+    return ordered
+
+
+# ─────────────────────────────────────────────
+#  Phase 2 – Mark entry line on warped frame
+# ─────────────────────────────────────────────
+
+line_points  = []
+mouse_pos_p2 = [0, 0]
+snap_mode    = True
+
+
+def _cb_line(event, x, y, flags, param):
+    global line_points, mouse_pos_p2
+    mouse_pos_p2 = [x, y]
+    if event == cv2.EVENT_LBUTTONDOWN and len(line_points) < 2:
+        if snap_mode and len(line_points) == 1:
+            sx, sy = snap_point(line_points[0][0], line_points[0][1], x, y)
+            line_points.append((sx, sy))
+        else:
+            line_points.append((x, y))
+        print(f"  Line point {len(line_points)}: {line_points[-1]}")
+
+
+def phase2_entry_line(warped):
+    """Let user mark the entry (green) line on the top-view frame."""
+    global line_points, snap_mode, mouse_pos_p2
+    line_points = []
+
+    # ── Ask ALL terminal input BEFORE opening any OpenCV window ──────────────
+    # On Windows, input() blocks the main thread which freezes GUI windows.
+    print("\n── STEP 2: Mark the ENTRY line ──────────────────────────────")
+    while True:
+        mode_input = input("Line mode – 1: straight (snap)  2: free  [1/2]: ").strip()
         if mode_input in ("1", "2"):
             snap_mode = (mode_input == "1")
             break
         print("  Please enter 1 or 2.")
 
-    if snap_mode:
-        print("\nPHASE 1: Click 2 points for the ENTRY line (GREEN).")
-        print("  2nd point snaps to horizontal or vertical.")
-    else:
-        print("\nPHASE 1: Click 2 points for the ENTRY line (GREEN).")
-    print("Press ENTER to confirm.\n")
+    print("\n  Click 2 points to define the ENTRY line (GREEN).")
+    print("  Press ENTER to confirm.\n")
+
+    # ── Now safe to open the window ───────────────────────────────────────────
+    win = "Calibration – Step 2: Entry Line"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, 1000, 700)
+    cv2.setMouseCallback(win, _cb_line)
 
     while True:
-        temp = frame.copy()
-        mx, my = mouse_pos
+        disp = warped.copy()
+        mx, my = mouse_pos_p2
 
-        if len(points) == 1:
-            sx, sy = snap(points[0][0], points[0][1], mx, my) if snap_mode else (mx, my)
-            cv2.line(temp, points[0], (sx, sy), (0, 255, 0), 1)
-            cv2.circle(temp, (sx, sy), 4, (0, 255, 0), -1)
+        if len(line_points) == 1:
+            ep = snap_point(line_points[0][0], line_points[0][1], mx, my) if snap_mode else (mx, my)
+            cv2.line(disp, line_points[0], ep, (0, 255, 0), 1)
+            cv2.circle(disp, ep, 4, (0, 255, 0), -1)
 
-        for i, p in enumerate(points):
-            cv2.circle(temp, p, 6, (0, 255, 0), -1)
-            cv2.putText(temp, str(i+1), (p[0]+8, p[1]-8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
-        if len(points) >= 2:
-            cv2.line(temp, points[0], points[1], (0, 255, 0), 2)
-            cv2.putText(temp, "ENTRY", (points[0][0], points[0][1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+        for i, p in enumerate(line_points):
+            cv2.circle(disp, p, 6, (0, 255, 0), -1)
+            cv2.putText(disp, str(i+1), (p[0]+8, p[1]-8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
-        cv2.putText(temp, f"Points marked: {len(points)}/2 (Press ENTER to confirm)", 
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-        cv2.imshow("Calibration", temp)
+        if len(line_points) == 2:
+            cv2.line(disp, line_points[0], line_points[1], (0, 255, 0), 2)
+            cv2.putText(disp, "ENTRY", (line_points[0][0], line_points[0][1]-12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        cv2.putText(disp, f"Points: {len(line_points)}/2  (ENTER to confirm)",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.imshow(win, disp)
+
         key = cv2.waitKey(1) & 0xFF
-        if key == 13 and len(points) == 2:
+        if key == 13 and len(line_points) == 2:
             break
-        if key == 27:
-            cap.release()
+        elif key == 27:
             cv2.destroyAllWindows()
-            return False
+            return None, None
 
-    p1, p2 = points[0], points[1]
-    
+    cv2.destroyAllWindows()
+    return line_points[0], line_points[1]
+
+
+# ─────────────────────────────────────────────
+#  Phase 3 – Position exit line on warped frame
+# ─────────────────────────────────────────────
+
+def phase3_exit_line(warped, p1, p2):
+    """Slide/resize the exit (red) line parallel to the entry line."""
     dx = p2[0] - p1[0]
     dy = p2[1] - p1[1]
-    length = math.hypot(dx, dy)
-    if length == 0: length = 1
+    length = math.hypot(dx, dy) or 1
     ux, uy = dx / length, dy / length
-    px_unit, py_unit = -uy, ux
+    px_unit, py_unit = -uy, ux               # perpendicular unit vector
 
-    exit_offset = 80
-    exit_scale = 1.0
+    exit_offset    = 80
+    exit_scale     = 1.0
     exit_confirmed = False
-    
+
     def get_exit_line(offset, scale):
         cx = (p1[0] + p2[0]) / 2
         cy = (p1[1] + p2[1]) / 2
@@ -126,71 +268,145 @@ def run_calibration(video_path):
         ex2 = (int(ecx + ux * half), int(ecy + uy * half))
         return ex1, ex2
 
-    def setup_mouse(event, x, y, flags, param):
+    def _cb_exit(event, x, y, flags, param):
         nonlocal exit_offset, exit_scale, exit_confirmed
         if event == cv2.EVENT_MOUSEMOVE:
-            cx, cy = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
+            cx = (p1[0] + p2[0]) / 2
+            cy = (p1[1] + p2[1]) / 2
             raw = (x - cx) * px_unit + (y - cy) * py_unit
             exit_offset = max(-1500, min(1500, raw))
         elif event == cv2.EVENT_MOUSEWHEEL:
-            exit_scale = min(exit_scale + 0.05, 5.0) if flags > 0 else max(exit_scale - 0.05, 0.1)
+            exit_scale = (min(exit_scale + 0.05, 5.0)
+                          if flags > 0 else max(exit_scale - 0.05, 0.1))
         elif event == cv2.EVENT_LBUTTONDOWN:
             exit_confirmed = True
 
-    cv2.setMouseCallback("Calibration", setup_mouse)
+    win = "Calibration – Step 3: Exit Line"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, 1000, 700)
+    cv2.setMouseCallback(win, _cb_exit)
 
-    print("\nPHASE 2: Position the EXIT line (RED).")
-    print("  Move mouse to slide it parallel.")
-    print("  Scroll wheel to resize.")
-    print("  Left-click to confirm, then press ENTER.\n")
+    print("\n── STEP 3: Position the EXIT line ───────────────────────────")
+    print("  Move mouse  → slide line parallel to entry line")
+    print("  Scroll wheel → resize line")
+    print("  Left-click  → confirm position, then press ENTER\n")
 
     while True:
-        temp = frame.copy()
-        cv2.line(temp, p1, p2, (0, 255, 0), 2)
+        disp = warped.copy()
+        cv2.line(disp, p1, p2, (0, 255, 0), 2)
+        cv2.putText(disp, "ENTRY", (p1[0], p1[1]-12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+
         ex1, ex2 = get_exit_line(exit_offset, exit_scale)
-        color = (0, 200, 255) if not exit_confirmed else (0, 0, 255)
-        cv2.line(temp, ex1, ex2, color, 2)
-        
-        status = "CONFIRMED - press ENTER" if exit_confirmed else "Move mouse | Scroll to resize | Click to confirm"
-        cv2.putText(temp, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2)
-        
-        cv2.imshow("Calibration", temp)
+        color = (0, 0, 255) if exit_confirmed else (0, 200, 255)
+        cv2.line(disp, ex1, ex2, color, 2)
+        cv2.putText(disp, "EXIT", (ex1[0], ex1[1]-12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+
+        status = ("CONFIRMED – press ENTER"
+                  if exit_confirmed
+                  else "Move mouse | Scroll to resize | Click to confirm")
+        cv2.putText(disp, status, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
+        cv2.imshow(win, disp)
         key = cv2.waitKey(1) & 0xFF
         if key == 13 and exit_confirmed:
             break
+        elif key == 27:
+            cv2.destroyAllWindows()
+            return None, None
 
     cv2.destroyAllWindows()
+    return get_exit_line(exit_offset, exit_scale)
+
+
+# ─────────────────────────────────────────────
+#  Main calibration runner
+# ─────────────────────────────────────────────
+
+def run_calibration(video_path):
+    cap = cv2.VideoCapture(video_path)
+    ret, frame = cap.read()
     cap.release()
+    if not ret:
+        print("Error reading video for calibration.")
+        return False
 
-    ex1, ex2 = get_exit_line(exit_offset, exit_scale)
-    
-    cv2.destroyAllWindows()
-    
+    h_orig, w_orig = frame.shape[:2]
+
+    # ── Phase 1: quad selection ──────────────────
+    ordered_quad = phase1_mark_quad(frame)
+    if ordered_quad is None:
+        return False
+
+    # Compute output (warped) dimensions:
+    # width  = average of top & bottom edge lengths
+    # height = average of left & right edge lengths
+    tl, tr, br, bl = ordered_quad
+    w_top    = np.linalg.norm(tr - tl)
+    w_bottom = np.linalg.norm(br - bl)
+    h_left   = np.linalg.norm(bl - tl)
+    h_right  = np.linalg.norm(br - tr)
+    dst_w = int(max(w_top, w_bottom))
+    dst_h = int(max(h_left, h_right))
+
+    if dst_w < 10 or dst_h < 10:
+        print(f"\n❌ ERROR: Warped size is {dst_w}×{dst_h} px — points are collinear or too close.")
+        print("   Please re-run and pick 4 corners that form a proper quadrilateral.")
+        return False
+
+    H = compute_homography(ordered_quad, dst_w, dst_h)
+    warped = warp_frame(frame, H, dst_w, dst_h)
+
+    print(f"\n  Warped frame size: {dst_w} × {dst_h} px")
+
+    # ── Phase 2: entry line on warped frame ──────
+    p1, p2 = phase2_entry_line(warped)
+    if p1 is None:
+        return False
+
+    # ── Phase 3: exit line on warped frame ───────
+    ex1, ex2 = phase3_exit_line(warped, p1, p2)
+    if ex1 is None:
+        return False
+
+    # ── Real-world distance ───────────────────────
     try:
-        real_distance = float(input("\nEnter distance between lines (meters): "))
+        real_distance = float(input("\nEnter distance between the two lines (meters): "))
     except ValueError:
         real_distance = 10.0
         print("Invalid input, defaulting to 10.0 meters")
 
+    # ── Save calibration ──────────────────────────
     calibration_data = {
-        "line_A": [list(p1), list(p2)],
-        "line_B": [list(ex1), list(ex2)],
+        "homography": {
+            "src_quad": ordered_quad.tolist(),          # 4 pts in original frame
+            "dst_size": [dst_w, dst_h],                 # warped frame size
+            "matrix":   H.tolist()                      # 3×3 matrix
+        },
+        "line_A": [list(p1),  list(p2)],               # entry line  (warped coords)
+        "line_B": [list(ex1), list(ex2)],               # exit line   (warped coords)
         "real_distance": real_distance,
         "video_reference": video_path
     }
 
     with open("calibration.json", "w") as f:
         json.dump(calibration_data, f, indent=4)
-        
+
     print("\n✅ Calibration saved to calibration.json")
+    print(f"   Homography matrix stored – pipeline must warp each frame before speed calc.")
     return True
 
+
+# ─────────────────────────────────────────────
+#  Entry point
+# ─────────────────────────────────────────────
+
 if __name__ == "__main__":
-    v_path = input("Enter path to a reference video (or Google Drive link): ").strip()
-    
+    v_path     = input("Enter path to a reference video (or Google Drive link): ").strip()
     local_path = download_from_drive(v_path)
     run_calibration(local_path)
-    
-    # Cleanup downloaded video
+
     if local_path == "temp_calibration_video.mp4" and os.path.exists(local_path):
         os.remove(local_path)

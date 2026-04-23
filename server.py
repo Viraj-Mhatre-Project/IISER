@@ -76,6 +76,26 @@ def signup(req: AuthRequest):
     save_json("users.json", users)
     return {"message": "User created successfully", "token": f"token-{req.username}", "role": "user", "username": req.username}
 
+@app.delete("/api/runs/{run_id}")
+def delete_run(run_id: str):
+    """Delete a run's record from runs.json and remove its output folder."""
+    import shutil
+ 
+    # Remove from runs.json
+    runs = load_runs()
+    new_runs = [r for r in runs if r.get("run_id") != run_id]
+    if len(new_runs) == len(runs):
+        raise HTTPException(status_code=404, detail="Run not found")
+    with open(RUNS_FILE, "w") as f:
+        json.dump(new_runs, f, indent=2)
+ 
+    # Remove output folder
+    run_dir = os.path.join("outputs_roi", run_id)
+    if os.path.exists(run_dir):
+        shutil.rmtree(run_dir)
+ 
+    return {"status": "deleted", "run_id": run_id}
+
 # ---------------------------------------------------------
 # PROGRESS STATE (in-memory per process, good enough for single-user)
 # ---------------------------------------------------------

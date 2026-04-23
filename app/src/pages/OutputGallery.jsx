@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Search, Filter, Bell, UploadCloud, Play, FileText, BarChart2, Download, ChevronLeft, ChevronRight, X } from 'lucide-react';
+import { Search, Filter, Bell, UploadCloud, Play, FileText, BarChart2, Download, ChevronLeft, ChevronRight, X, Trash2 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 
 const API = 'http://localhost:8000';
@@ -21,13 +21,14 @@ function Badge({ children, color = 'zinc' }) {
 function StatPill({ label, value, unit = '' }) {
   return (
     <div className="text-center">
-      <p className="text-lg font-extrabold text-white tabular-nums">{value}<span className="text-xs text-zinc-500 ml-0.5">{unit}</span></p>
+      <p className="text-lg font-extrabold text-white tabular-nums">
+        {value}<span className="text-xs text-zinc-500 ml-0.5">{unit}</span>
+      </p>
       <p className="text-[9px] text-zinc-600 uppercase font-bold tracking-wider">{label}</p>
     </div>
   );
 }
 
-// Modal to preview video or image in full screen
 function PreviewModal({ src, type, onClose }) {
   useEffect(() => {
     const esc = (e) => { if (e.key === 'Escape') onClose(); };
@@ -52,22 +53,76 @@ function PreviewModal({ src, type, onClose }) {
   );
 }
 
-function RunCard({ run }) {
-  const [preview, setPreview] = useState(null); // { src, type }
+function DeleteConfirmModal({ runId, onConfirm, onCancel }) {
+  return (
+    <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-6">
+      <div className="glass-card rounded-2xl border border-white/10 p-6 max-w-sm w-full" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center gap-3 mb-4">
+          <div className="w-10 h-10 rounded-xl bg-red-500/10 flex items-center justify-center border border-red-500/20">
+            <Trash2 size={18} className="text-red-400" />
+          </div>
+          <div>
+            <p className="text-sm font-bold text-white">Delete Run</p>
+            <p className="text-[10px] text-zinc-500">{runId}</p>
+          </div>
+        </div>
+        <p className="text-sm text-zinc-400 mb-6 leading-relaxed">
+          This will permanently delete all output files for this run including the video, CSV log, and speed graph. This cannot be undone.
+        </p>
+        <div className="flex gap-3">
+          <button onClick={onCancel}
+            className="flex-1 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-zinc-300 text-xs font-bold border border-white/10 transition-all">
+            Cancel
+          </button>
+          <button onClick={onConfirm}
+            className="flex-1 py-2 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-400 text-xs font-bold border border-red-500/20 transition-all">
+            Delete
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RunCard({ run, onDeleted }) {
+  const [preview, setPreview] = useState(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   const videoUrl = run.video_path ? `${API}/api/file/${run.run_id}/output.mp4` : null;
   const csvUrl = run.csv_path ? `${API}/api/file/${run.run_id}/log.csv` : null;
   const graphUrl = run.graph_path ? `${API}/api/file/${run.run_id}/speed_graph.png` : null;
 
   const date = run.timestamp
-    ? new Date(run.timestamp).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })
+    ? new Date(run.timestamp).toLocaleString('en-IN', {
+      day: '2-digit', month: 'short', year: 'numeric',
+      hour: '2-digit', minute: '2-digit',
+    })
     : '—';
 
-  const overspeed = run.max_speed > (run.speed_limit ?? 60);
+  const handleDelete = async () => {
+    setDeleting(true);
+    try {
+      await fetch(`${API}/api/runs/${run.run_id}`, { method: 'DELETE' });
+      onDeleted(run.run_id);
+    } catch (e) {
+      console.error('Delete failed:', e);
+    } finally {
+      setDeleting(false);
+      setConfirmDelete(false);
+    }
+  };
 
   return (
     <>
       {preview && <PreviewModal {...preview} onClose={() => setPreview(null)} />}
+      {confirmDelete && (
+        <DeleteConfirmModal
+          runId={run.run_id}
+          onConfirm={handleDelete}
+          onCancel={() => setConfirmDelete(false)}
+        />
+      )}
 
       <div className="glass-card rounded-2xl border border-white/5 overflow-hidden hover:border-white/10 transition-all">
         {/* Top bar */}
@@ -77,8 +132,14 @@ function RunCard({ run }) {
             <p className="text-[10px] text-zinc-500 mt-0.5">{date}</p>
           </div>
           <div className="flex items-center gap-2">
-            {overspeed && <Badge color="red">Overspeed</Badge>}
             <Badge color="green">Complete</Badge>
+            <button
+              onClick={() => setConfirmDelete(true)}
+              disabled={deleting}
+              className="w-7 h-7 rounded-lg bg-red-500/5 hover:bg-red-500/15 border border-red-500/10 hover:border-red-500/30 flex items-center justify-center transition-all group"
+              title="Delete run">
+              <Trash2 size={13} className="text-red-500/40 group-hover:text-red-400 transition-colors" />
+            </button>
           </div>
         </div>
 
@@ -90,11 +151,13 @@ function RunCard({ run }) {
           <StatPill label="Limit" value={run.speed_limit ?? 60} unit="km/h" />
         </div>
 
-        {/* Graph thumbnail (if available) */}
+        {/* Graph thumbnail */}
         {graphUrl && (
           <div className="px-5 py-3 border-b border-white/5 cursor-pointer"
             onClick={() => setPreview({ src: graphUrl, type: 'image' })}>
-            <img src={graphUrl} alt="Speed distribution" className="w-full rounded-lg opacity-80 hover:opacity-100 transition-opacity" style={{ maxHeight: 120, objectFit: 'cover' }} />
+            <img src={graphUrl} alt="Speed distribution"
+              className="w-full rounded-lg opacity-80 hover:opacity-100 transition-opacity"
+              style={{ maxHeight: 120, objectFit: 'cover' }} />
           </div>
         )}
 
@@ -136,7 +199,7 @@ export default function OutputGallery() {
   const [runs, setRuns] = useState([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
-  const [sortOrder, setSortOrder] = useState('latest'); // latest | oldest
+  const [sortOrder, setSortOrder] = useState('latest');
   const [page, setPage] = useState(1);
 
   useEffect(() => {
@@ -145,6 +208,10 @@ export default function OutputGallery() {
       .then(d => { setRuns(d.runs ?? []); setLoading(false); })
       .catch(() => setLoading(false));
   }, []);
+
+  const handleDeleted = (run_id) => {
+    setRuns(prev => prev.filter(r => r.run_id !== run_id));
+  };
 
   const filtered = runs
     .filter(r => r.run_id?.toLowerCase().includes(search.toLowerCase()))
@@ -177,24 +244,19 @@ export default function OutputGallery() {
       </header>
 
       <div className="flex-1 p-8 max-w-7xl mx-auto w-full flex flex-col animate-in fade-in duration-500">
-
         {/* Page header */}
         <div className="flex justify-between items-end mb-8">
-          <div>
-            <div className="flex items-center gap-3 mb-2">
-              <h1 className="text-3xl font-extrabold text-white tracking-tight">Output Gallery</h1>
-              <span className="px-2 py-1 rounded-md bg-white/10 text-[10px] font-bold tracking-widest text-zinc-400 uppercase border border-white/5">
-                {filtered.length} Run{filtered.length !== 1 ? 's' : ''}
-              </span>
-            </div>
+          <div className="flex items-center gap-3">
+            <h1 className="text-3xl font-extrabold text-white tracking-tight">Output Gallery</h1>
+            <span className="px-2 py-1 rounded-md bg-white/10 text-[10px] font-bold tracking-widest text-zinc-400 uppercase border border-white/5">
+              {filtered.length} Run{filtered.length !== 1 ? 's' : ''}
+            </span>
           </div>
-          <div className="flex gap-3 text-xs font-bold text-zinc-400">
-            <button
-              onClick={() => { setSortOrder(s => s === 'latest' ? 'oldest' : 'latest'); setPage(1); }}
-              className="px-4 py-2 rounded-lg bg-white/5 border border-white/5 flex items-center gap-2 hover:text-white transition">
-              <Filter size={14} /> {sortOrder === 'latest' ? 'LATEST FIRST' : 'OLDEST FIRST'}
-            </button>
-          </div>
+          <button
+            onClick={() => { setSortOrder(s => s === 'latest' ? 'oldest' : 'latest'); setPage(1); }}
+            className="px-4 py-2 rounded-lg bg-white/5 border border-white/5 flex items-center gap-2 text-xs font-bold text-zinc-400 hover:text-white transition">
+            <Filter size={14} /> {sortOrder === 'latest' ? 'LATEST FIRST' : 'OLDEST FIRST'}
+          </button>
         </div>
 
         {/* Content */}
@@ -220,33 +282,34 @@ export default function OutputGallery() {
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
-            {paginated.map(run => <RunCard key={run.run_id} run={run} />)}
+            {paginated.map(run => <RunCard key={run.run_id} run={run} onDeleted={handleDeleted} />)}
           </div>
         )}
 
         {/* Pagination */}
-        <div className="mt-6 flex justify-between items-center text-xs font-bold text-zinc-600">
-          <span>
-            Showing {Math.min((page - 1) * PAGE_SIZE + 1, filtered.length)}–{Math.min(page * PAGE_SIZE, filtered.length)} of {filtered.length} results
-          </span>
-          <div className="flex gap-2 items-center">
-            <button disabled={page <= 1} onClick={() => setPage(p => p - 1)}
-              className="w-8 h-8 rounded bg-white/5 flex items-center justify-center disabled:opacity-30 hover:bg-white/10 transition">
-              <ChevronLeft size={14} />
-            </button>
-            {Array.from({ length: totalPages }, (_, i) => (
-              <button key={i} onClick={() => setPage(i + 1)}
-                className={`w-8 h-8 rounded text-xs font-bold transition ${page === i + 1 ? 'bg-primary text-white' : 'bg-white/5 hover:bg-white/10 text-zinc-400'}`}>
-                {i + 1}
+        {!loading && paginated.length > 0 && (
+          <div className="mt-6 flex justify-between items-center text-xs font-bold text-zinc-600">
+            <span>
+              Showing {Math.min((page - 1) * PAGE_SIZE + 1, filtered.length)}–{Math.min(page * PAGE_SIZE, filtered.length)} of {filtered.length} results
+            </span>
+            <div className="flex gap-2 items-center">
+              <button disabled={page <= 1} onClick={() => setPage(p => p - 1)}
+                className="w-8 h-8 rounded bg-white/5 flex items-center justify-center disabled:opacity-30 hover:bg-white/10 transition">
+                <ChevronLeft size={14} />
               </button>
-            ))}
-            <button disabled={page >= totalPages} onClick={() => setPage(p => p + 1)}
-              className="w-8 h-8 rounded bg-white/5 flex items-center justify-center disabled:opacity-30 hover:bg-white/10 transition">
-              <ChevronRight size={14} />
-            </button>
+              {Array.from({ length: totalPages }, (_, i) => (
+                <button key={i} onClick={() => setPage(i + 1)}
+                  className={`w-8 h-8 rounded text-xs font-bold transition ${page === i + 1 ? 'bg-primary text-white' : 'bg-white/5 hover:bg-white/10 text-zinc-400'}`}>
+                  {i + 1}
+                </button>
+              ))}
+              <button disabled={page >= totalPages} onClick={() => setPage(p => p + 1)}
+                className="w-8 h-8 rounded bg-white/5 flex items-center justify-center disabled:opacity-30 hover:bg-white/10 transition">
+                <ChevronRight size={14} />
+              </button>
+            </div>
           </div>
-        </div>
-
+        )}
       </div>
     </div>
   );

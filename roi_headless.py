@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 import os
-import math
+import subprocess
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
@@ -13,42 +13,139 @@ import gdown
 import json
 import glob
 import logging
-import subprocess
 
 logging.getLogger("ultralytics").setLevel(logging.ERROR)
 
-SAVE_FRAMES = False
-MIN_TRAVEL_TIME = 0.3
+SAVE_FRAMES     = False
+MIN_TRAVEL_TIME = 0.5
 MAX_TRAVEL_TIME = 30.0
+CROSS_COOLDOWN  = 0.4
+EMA_ALPHA       = 0.35
+MAX_SPEED_KMH   = 250.0
+
 
 def download_from_drive(link):
-    if "drive.google.com" not in link: return link
+    if "drive.google.com" not in link:
+        return link
     try:
         file_id = link.split("/d/")[1].split("/")[0]
     except IndexError:
         return link
     download_url = f"https://drive.google.com/uc?id={file_id}"
-    output_path = "temp_video.mp4"
+    output_path  = "temp_video.mp4"
     gdown.download(download_url, output_path, quiet=True)
     return output_path
+
+
+# ── Codec / writer helpers ────────────────────────────────────────────────────
+
+def _ffmpeg_available():
+    """Return True if ffmpeg is on PATH."""
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+        return True
+    except Exception:
+        return False
+
+
+def _avc1_available(width, height, fps):
+    """Return True if OpenCV can open a VideoWriter with avc1."""
+    try:
+        tmp = "__codec_test__.mp4"
+        writer = cv2.VideoWriter(tmp, cv2.VideoWriter_fourcc(*'avc1'),
+                                 fps, (width, height))
+        ok = writer.isOpened()
+        writer.release()
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return ok
+    except Exception:
+        return False
+
+
+def make_writer(path, fps, width, height):
+    """
+    Choose the best available codec in order:
+      1. avc1  (H.264 via OpenCV — works on most Windows/macOS builds)
+      2. mp4v  (fallback raw — will be re-encoded by ffmpeg after processing)
+    Returns (writer, used_codec).
+    """
+    if _avc1_available(width, height, fps):
+        print("[codec] Using avc1 (H.264) directly.")
+        return (cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'avc1'), fps, (width, height)),
+                'avc1')
+    print("[codec] avc1 unavailable — using mp4v with post-process ffmpeg re-encode.")
+    return (cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height)),
+            'mp4v')
+
+
+def reencode_h264(mp4_path):
+    """
+    Re-encode an mp4v file to H.264 using ffmpeg.
+    Replaces the original file in-place.
+    Returns True on success, False if ffmpeg is unavailable or fails.
+    """
+    if not _ffmpeg_available():
+        print("[codec] ffmpeg not found — video may not play in browser.")
+        print("[codec] Install ffmpeg and add it to PATH to fix this.")
+        return False
+
+    tmp = mp4_path.replace(".mp4", "_raw.mp4")
+    try:
+        os.rename(mp4_path, tmp)
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", tmp,
+             "-vcodec", "libx264",
+             "-pix_fmt", "yuv420p",
+             "-movflags", "+faststart",
+             "-crf", "23",
+             mp4_path],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            print(f"[codec] ffmpeg failed:\n{result.stderr}")
+            os.rename(tmp, mp4_path)   # restore original
+            return False
+        os.remove(tmp)
+        print("[codec] Re-encoded to H.264 successfully.")
+        return True
+    except Exception as e:
+        print(f"[codec] Re-encode error: {e}")
+        if os.path.exists(tmp) and not os.path.exists(mp4_path):
+            os.rename(tmp, mp4_path)
+        return False
+
+
+# ── Main processing function ──────────────────────────────────────────────────
 
 def side_of_line(cx, cy, line):
     (x1, y1), (x2, y2) = line
     val = (x2 - x1) * (cy - y1) - (y2 - y1) * (cx - x1)
     return 1 if val >= 0 else -1
 
+
 def draw_label(frame, x1, y1, text, color=(0, 255, 255)):
-    font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1
+    font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1
     (tw, th), bl = cv2.getTextSize(text, font, scale, thick)
     lx, ly = max(x1, 2), max(y1 - 4, th + 6)
     cv2.rectangle(frame, (lx - 2, ly - th - 4), (lx + tw + 4, ly + bl + 2), (0, 0, 0), -1)
     cv2.putText(frame, text, (lx, ly - 2), font, scale, color, thick, cv2.LINE_AA)
 
+
+def project_point(pt, H):
+    p = np.array([[[float(pt[0]), float(pt[1])]]], dtype="float32")
+    warped = cv2.perspectiveTransform(p, H)
+    return float(warped[0][0][0]), float(warped[0][0][1])
+
+
 def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_state=None):
     """
-    progress_state: optional dict with keys:
-        stage, total_frames, extracted_frames, processed_frames
-    Updated in-place so the SSE endpoint can stream real values.
+    Detect & track on the ORIGINAL frame.
+    Project centroids into warped space for line-crossing logic.
+    Output video is H.264 — browser-playable on any device.
+    Strategy:
+      • Try avc1 first (no ffmpeg needed).
+      • Fall back to mp4v + ffmpeg re-encode if avc1 is unavailable.
     """
 
     def update(stage=None, **kwargs):
@@ -58,6 +155,7 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
             progress_state["stage"] = stage
         progress_state.update(kwargs)
 
+    # ── Calibration ───────────────────────────────────────────────────────────
     if not os.path.exists("calibration.json"):
         print("ERROR: calibration.json not found.")
         return None
@@ -65,8 +163,17 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
     with open("calibration.json", "r") as f:
         calib = json.load(f)
 
-    line_A = tuple(map(tuple, calib["line_A"]))
-    line_B = tuple(map(tuple, calib["line_B"]))
+    has_homography = "homography" in calib
+    if has_homography:
+        H            = np.array(calib["homography"]["matrix"], dtype="float64")
+        H_inv        = np.linalg.inv(H)
+        dst_w, dst_h = calib["homography"]["dst_size"]
+    else:
+        H = H_inv = None
+        dst_w = dst_h = None
+
+    line_A        = tuple(map(tuple, calib["line_A"]))
+    line_B        = tuple(map(tuple, calib["line_B"]))
     real_distance = calib["real_distance"]
 
     line_A_y = (line_A[0][1] + line_A[1][1]) / 2
@@ -74,11 +181,8 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
     roi_y_lo = min(line_A_y, line_B_y) - 20
     roi_y_hi = max(line_A_y, line_B_y) + 20
 
-    dx = line_A[1][0] - line_A[0][0]
-    dy = line_A[1][1] - line_A[0][1]
-    length = math.hypot(dx, dy)
-
-    def in_roi(cy): return roi_y_lo <= cy <= roi_y_hi
+    def in_roi_warped(wcy):
+        return roi_y_lo <= wcy <= roi_y_hi
 
     update("loading_video")
 
@@ -87,10 +191,11 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
         print("Error reading video.")
         return None
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps          = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    orig_w       = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out_w, out_h = orig_w, orig_h
 
     update("extracting", total_frames=total_frames, extracted_frames=0, processed_frames=0)
 
@@ -99,142 +204,217 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
     os.makedirs(save_dir, exist_ok=True)
     if not run_id:
         existing = glob.glob(f"{save_dir}/Run*")
-        max_run = 0
+        max_run  = 0
         for folder in existing:
             m = re.match(r'Run(\d+)_', os.path.basename(folder))
-            if m: max_run = max(max_run, int(m.group(1)))
-        now = datetime.now()
+            if m:
+                max_run = max(max_run, int(m.group(1)))
+        now      = datetime.now()
         run_name = f"Run{max_run + 1}_{now.strftime('%d-%m_%H-%M')}"
     else:
         run_name = run_id
 
-    run_dir = f"{save_dir}/{run_name}"
+    run_dir  = f"{save_dir}/{run_name}"
     os.makedirs(run_dir, exist_ok=True)
 
     mp4_path = f"{run_dir}/output.mp4"
-    out = cv2.VideoWriter(mp4_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
 
-    first_cross_time, first_cross_cy, first_cross_line = {}, {}, {}
-    second_cross_time, speeds, ema_speed = {}, {}, {}
-    prev_side_A, prev_side_B = {}, {}
-    log_data = []
+    # ── Pick best codec for this device ──────────────────────────────────────
+    writer, used_codec = make_writer(mp4_path, fps, out_w, out_h)
 
-    frame_count = 0
+    # ── Back-project warped lines to original frame for drawing ──────────────
+    def warp_to_orig(pt):
+        p = np.array([[[float(pt[0]), float(pt[1])]]], dtype="float32")
+        orig = cv2.perspectiveTransform(p, H_inv)
+        return (int(orig[0][0][0]), int(orig[0][0][1]))
+
+    if has_homography:
+        line_A_orig = (warp_to_orig(line_A[0]), warp_to_orig(line_A[1]))
+        line_B_orig = (warp_to_orig(line_B[0]), warp_to_orig(line_B[1]))
+    else:
+        line_A_orig = line_A
+        line_B_orig = line_B
+
+    # ── Per-vehicle state ─────────────────────────────────────────────────────
+    first_cross_time  = {}
+    first_cross_line  = {}
+    second_cross_time = {}
+    last_cross_time   = {}
+    speeds            = {}
+    prev_side_A       = {}
+    prev_side_B       = {}
+    log_data          = []
+    frame_count       = 0
+
     while True:
-        # ── Cancellation check ───────────────────────────────────────────────
         if progress_state is not None and progress_state.get("cancelled", False):
             print("Processing cancelled by user.")
             cap.release()
-            out.release()
+            writer.release()
             return None
-        # ─────────────────────────────────────────────────────────────────────
 
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Update extracted count
         update(extracted_frames=frame_count + 1)
-
         t = frame_count / fps
         update("detecting")
+
         results = model.track(frame, persist=True, tracker="botsort.yaml", verbose=False)
 
         if results[0].boxes.id is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy()
-            ids = results[0].boxes.id.cpu().numpy().astype(int)
-            clss = results[0].boxes.cls.cpu().numpy().astype(int)
+            ids   = results[0].boxes.id.cpu().numpy().astype(int)
+            clss  = results[0].boxes.cls.cpu().numpy().astype(int)
 
             for box, obj_id, cls in zip(boxes, ids, clss):
                 x1, y1, x2, y2 = map(int, box)
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                sA, sB = side_of_line(cx, cy, line_A), side_of_line(cx, cy, line_B)
+                cx_orig = (x1 + x2) / 2
+                cy_orig = (y1 + y2) / 2
 
-                if in_roi(cy):
+                if has_homography:
+                    wcx, wcy = project_point((cx_orig, cy_orig), H)
+                else:
+                    wcx, wcy = cx_orig, cy_orig
+
+                sA = side_of_line(wcx, wcy, line_A)
+                sB = side_of_line(wcx, wcy, line_B)
+                in_zone = in_roi_warped(wcy)
+
+                if in_zone:
+                    since_last = t - last_cross_time.get(obj_id, -999)
+
                     if obj_id not in first_cross_time:
-                        if obj_id in prev_side_A and prev_side_A[obj_id] != sA:
-                            first_cross_time[obj_id], first_cross_cy[obj_id], first_cross_line[obj_id] = t, cy, 'A'
-                        elif obj_id in prev_side_B and prev_side_B[obj_id] != sB:
-                            first_cross_time[obj_id], first_cross_cy[obj_id], first_cross_line[obj_id] = t, cy, 'B'
+                        crossed_A = obj_id in prev_side_A and prev_side_A[obj_id] != sA
+                        crossed_B = obj_id in prev_side_B and prev_side_B[obj_id] != sB
+                        if (crossed_A or crossed_B) and since_last >= CROSS_COOLDOWN:
+                            first_cross_time[obj_id] = t
+                            first_cross_line[obj_id] = 'A' if crossed_A else 'B'
+                            last_cross_time[obj_id]  = t
+
                     elif obj_id not in second_cross_time:
-                        other_label = 'B' if first_cross_line[obj_id] == 'A' else 'A'
-                        other_prev = prev_side_B if first_cross_line[obj_id] == 'A' else prev_side_A
-                        other_curr = sB if first_cross_line[obj_id] == 'A' else sA
+                        other_prev  = prev_side_B if first_cross_line[obj_id] == 'A' else prev_side_A
+                        other_curr  = sB          if first_cross_line[obj_id] == 'A' else sA
+                        other_label = 'B'         if first_cross_line[obj_id] == 'A' else 'A'
 
-                        if obj_id in other_prev and other_prev[obj_id] != other_curr:
+                        crossed_second = (
+                            obj_id in other_prev
+                            and other_prev[obj_id] != other_curr
+                            and since_last >= CROSS_COOLDOWN
+                        )
+
+                        if crossed_second:
                             dt = t - first_cross_time[obj_id]
+
                             if MIN_TRAVEL_TIME <= dt <= MAX_TRAVEL_TIME:
-                                spd = (real_distance / dt) * 3.6
-                                speeds[obj_id] = spd
-                                second_cross_time[obj_id] = t
-                                log_data.append({
-                                    "ID": obj_id, "Class": model.names[cls],
-                                    "EntryLine": first_cross_line[obj_id], "EntryTime": round(first_cross_time[obj_id], 3),
-                                    "ExitLine": other_label, "ExitTime": round(t, 3),
-                                    "Duration_s": round(dt, 3), "Speed_kmh": round(spd, 2)
-                                })
+                                raw_spd = (real_distance / dt) * 3.6
+                                if raw_spd <= MAX_SPEED_KMH:
+                                    prev_spd = speeds.get(obj_id, raw_spd)
+                                    smoothed = EMA_ALPHA * raw_spd + (1 - EMA_ALPHA) * prev_spd
+                                    speeds[obj_id]            = smoothed
+                                    second_cross_time[obj_id] = t
+                                    last_cross_time[obj_id]   = t
+
+                                    log_data.append({
+                                        "ID":           obj_id,
+                                        "Class":        model.names[cls],
+                                        "EntryLine":    first_cross_line[obj_id],
+                                        "EntryTime":    round(first_cross_time[obj_id], 3),
+                                        "ExitLine":     other_label,
+                                        "ExitTime":     round(t, 3),
+                                        "Duration_s":   round(dt, 3),
+                                        "Speed_kmh":    round(smoothed, 2),
+                                        "RawSpeed_kmh": round(raw_spd, 2),
+                                    })
+
+                                    first_cross_time.pop(obj_id, None)
+                                    first_cross_line.pop(obj_id, None)
+                                    second_cross_time.pop(obj_id, None)
+
                             elif dt > MAX_TRAVEL_TIME:
-                                del first_cross_time[obj_id], first_cross_cy[obj_id], first_cross_line[obj_id]
+                                first_cross_time.pop(obj_id, None)
+                                first_cross_line.pop(obj_id, None)
 
-                prev_side_A[obj_id], prev_side_B[obj_id] = sA, sB
+                prev_side_A[obj_id] = sA
+                prev_side_B[obj_id] = sB
 
-                box_color = (0, 255, 0) if in_roi(cy) else (0, 200, 255)
+                box_color = (0, 255, 0) if in_zone else (0, 200, 255)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-
                 if obj_id in speeds:
-                    draw_label(frame, x1, y1, f"ID {obj_id} | {speeds[obj_id]:.1f} km/h", (0, 255, 0))
+                    draw_label(frame, x1, y1,
+                               f"ID {obj_id} | {speeds[obj_id]:.1f} km/h", (0, 255, 0))
                 else:
                     draw_label(frame, x1, y1, f"ID {obj_id}", (200, 200, 200))
 
-        cv2.line(frame, line_A[0], line_A[1], (0, 255, 255), 2)
-        cv2.line(frame, line_B[0], line_B[1], (0, 255, 255), 2)
+        cv2.line(frame, line_A_orig[0], line_A_orig[1], (0, 255, 255), 2)
+        cv2.line(frame, line_B_orig[0], line_B_orig[1], (0, 255, 255), 2)
+        cv2.putText(frame, "A", (line_A_orig[0][0] - 20, line_A_orig[0][1]),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(frame, "B", (line_B_orig[0][0] - 20, line_B_orig[0][1]),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        out.write(frame)
+        writer.write(frame)
         frame_count += 1
         update(processed_frames=frame_count)
 
     cap.release()
-    out.release()
+    writer.release()
 
-    # Re-encode to H.264 so browsers can play it natively
-    temp_path = mp4_path.replace(".mp4", "_raw.mp4")
-    try:
-        os.rename(mp4_path, temp_path)
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", temp_path,
-             "-vcodec", "libx264", "-preset", "fast", "-crf", "23",
-             "-movflags", "+faststart",
-             mp4_path],
-            check=True, capture_output=True
-        )
-        os.remove(temp_path)
-        print("Video re-encoded to H.264 successfully.")
-    except Exception as e:
-        print(f"ffmpeg re-encode skipped ({e}). Video may not play in browser.")
-        if os.path.exists(temp_path) and not os.path.exists(mp4_path):
-            os.rename(temp_path, mp4_path)
+    # ── If we used mp4v, re-encode to H.264 via ffmpeg ────────────────────────
+    if used_codec == 'mp4v':
+        update("finalizing")
+        reencode_h264(mp4_path)
 
     update("finalizing")
 
-    df = pd.DataFrame(log_data)
-    csv_path = None
+    df         = pd.DataFrame(log_data)
+    csv_path   = None
     graph_path = None
 
     if not df.empty:
         csv_path = f"{run_dir}/log.csv"
         df.to_csv(csv_path, index=False)
 
-        # Generate speed distribution graph
+        # ── Per-vehicle speed bar chart ───────────────────────────────────────
         graph_path = f"{run_dir}/speed_graph.png"
-        fig, ax = plt.subplots(figsize=(8, 4), facecolor="#0d1117")
+        n   = len(df)
+        fig, ax = plt.subplots(figsize=(max(8, n * 0.9), 5), facecolor="#0d1117")
         ax.set_facecolor("#0d1117")
-        ax.hist(df["Speed_kmh"], bins=15, color="#3b82f6", edgecolor="#1e40af", alpha=0.85)
-        ax.set_xlabel("Speed (km/h)", color="#9ca3af", fontsize=11)
-        ax.set_ylabel("Vehicle Count", color="#9ca3af", fontsize=11)
-        ax.set_title("Speed Distribution", color="#f9fafb", fontsize=13, fontweight="bold")
+
+        vehicle_ids    = df["ID"].astype(str).tolist()
+        vehicle_speeds = df["Speed_kmh"].tolist()
+        x_pos          = list(range(n))
+        bar_colors     = ["#ef4444" if s > 60 else "#3b82f6" for s in vehicle_speeds]
+
+        bars = ax.bar(x_pos, vehicle_speeds, color=bar_colors,
+                      edgecolor="#1e293b", alpha=0.9, width=0.6)
+
+        for bar, speed in zip(bars, vehicle_speeds):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.8,
+                f"{speed:.1f}",
+                ha='center', va='bottom',
+                color="#e5e7eb", fontsize=8, fontweight='bold'
+            )
+
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(
+            [f"ID {vid}" for vid in vehicle_ids],
+            color="#9ca3af", fontsize=9,
+            rotation=45 if n > 8 else 0,
+            ha='right' if n > 8 else 'center'
+        )
+        ax.set_xlabel("Vehicle ID",       color="#9ca3af", fontsize=11)
+        ax.set_ylabel("Speed (km/h)",     color="#9ca3af", fontsize=11)
+        ax.set_title("Speed per Vehicle", color="#f9fafb", fontsize=13, fontweight="bold")
         ax.tick_params(colors="#6b7280")
+        ax.yaxis.grid(True, color="#1f2937", linewidth=0.5, linestyle='--')
+        ax.set_axisbelow(True)
         for spine in ax.spines.values():
             spine.set_edgecolor("#374151")
+
         plt.tight_layout()
         plt.savefig(graph_path, dpi=120, bbox_inches="tight", facecolor="#0d1117")
         plt.close(fig)
@@ -242,12 +422,12 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
     update("done")
 
     return {
-        "run_id": run_name,
-        "video_path": mp4_path,
-        "csv_path": csv_path,
-        "graph_path": graph_path,
-        "total_vehicles": len(df),
-        "avg_speed": round(df["Speed_kmh"].mean(), 1) if not df.empty else 0,
-        "max_speed": round(df["Speed_kmh"].max(), 1) if not df.empty else 0,
-        "total_frames": total_frames,
+        "run_id":         run_name,
+        "video_path":     mp4_path,
+        "csv_path":       csv_path,
+        "graph_path":     graph_path,
+        "total_vehicles": df["ID"].nunique() if not df.empty else 0,
+        "avg_speed":      round(df["Speed_kmh"].mean(), 1) if not df.empty else 0,
+        "max_speed":      round(df["Speed_kmh"].max(),  1) if not df.empty else 0,
+        "total_frames":   total_frames,
     }
