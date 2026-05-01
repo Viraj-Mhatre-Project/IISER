@@ -1,5 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Search, Bell, AlertTriangle, Gauge, CarFront, Clock, TrendingUp, X, Play, Settings2, Check, RefreshCw } from 'lucide-react';
+import {
+  Search, Bell, AlertTriangle, Gauge, CarFront, Clock, TrendingUp, X, Play,
+  Settings2, Check, RefreshCw, FolderOpen, ChevronLeft, FileVideo, BarChart2,
+  FileText, Download, ChevronDown
+} from 'lucide-react';
 
 const API = 'http://localhost:8000';
 
@@ -21,13 +25,6 @@ function fmtTime(isoStr) {
   return new Date(isoStr).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
 }
 
-/**
- * Formats the vehicle identity label:
- *   - "car" / "motorcycle" / "bicycle" → generic  →  "VEHICLE ID: 42"
- *   - anything else (truck, bus, van…) → specific  →  "TRUCK · ID: 42"
- *
- * The class name from YOLO is lowercase (e.g. "truck", "bus", "car").
- */
 const GENERIC_CLASSES = new Set(['car', 'motorcycle', 'bicycle', 'motorbike']);
 
 function vehicleLabel(vehicleClass, vehicleId) {
@@ -66,32 +63,20 @@ function ViolationCard({ v, onPlay }) {
 
   return (
     <div className={`glass-card rounded-xl p-4 border ${col.border} ${col.bg} flex items-start gap-4 transition-all hover:scale-[1.01]`}>
-      {/* Severity stripe */}
       <div className={`shrink-0 mt-0.5 w-2 h-full min-h-[60px] rounded-full ${col.badge} opacity-80`} />
-
       <div className="flex-1 min-w-0 space-y-2">
-        {/* Top row */}
         <div className="flex flex-wrap items-center gap-2">
-          {/* Severity badge */}
           <span className={`text-[10px] font-black uppercase tracking-widest px-2 py-0.5 rounded-md border ${col.border} ${col.text}`}>
             {label}
           </span>
-
-          {/* Vehicle identity — key change */}
           <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider">
-            {prefix}
-            <span className="text-zinc-500 font-semibold"> · {id}</span>
+            {prefix}<span className="text-zinc-500 font-semibold"> · {id}</span>
           </span>
-
           <span className="ml-auto text-[10px] text-zinc-600 font-medium">{fmtTime(v.timestamp)}</span>
         </div>
-
-        {/* Speed row */}
         <div className="flex items-end gap-3">
           <div>
-            <p className={`text-3xl font-extrabold tabular-nums leading-none ${col.text}`}>
-              {v.speed_kmh}
-            </p>
+            <p className={`text-3xl font-extrabold tabular-nums leading-none ${col.text}`}>{v.speed_kmh}</p>
             <p className="text-[9px] text-zinc-500 font-bold uppercase tracking-wider mt-0.5">km/h recorded</p>
           </div>
           <div className="text-zinc-600 text-lg font-bold pb-1">vs</div>
@@ -103,24 +88,275 @@ function ViolationCard({ v, onPlay }) {
             +{v.excess_kmh} over
           </div>
         </div>
-
-        {/* Meta row */}
         <div className="flex flex-wrap gap-3 text-[10px] text-zinc-500 font-medium pt-0.5">
           <span className="flex items-center gap-1"><Clock size={10} /> {v.duration_s}s transit</span>
           <span className="flex items-center gap-1"><CarFront size={10} /> Run: {v.run_id}</span>
         </div>
       </div>
-
-      {/* Play button */}
-      <button
-        onClick={() => onPlay(v.video_url)}
-        className="shrink-0 flex flex-col items-center gap-1 group"
-        title="Play run video">
+      <button onClick={() => onPlay(v.video_url)}
+        className="shrink-0 flex flex-col items-center gap-1 group" title="Play run video">
         <div className="w-10 h-10 rounded-full bg-white/5 hover:bg-primary/20 border border-white/10 hover:border-primary/40 flex items-center justify-center transition-all group-hover:scale-110">
           <Play size={16} className="text-zinc-400 group-hover:text-primary transition-colors" fill="currentColor" />
         </div>
         <span className="text-[9px] text-zinc-600 font-bold uppercase tracking-wider">Video</span>
       </button>
+    </div>
+  );
+}
+
+// ── RunFolderBrowser ──────────────────────────────────────────────────────────
+function RunFolderBrowser({ onBack, speedLimit }) {
+  const [runs, setRuns] = useState([]);
+  const [selectedRun, setSelectedRun] = useState(null);
+  const [runViolations, setRunViolations] = useState([]);
+  const [runDetail, setRunDetail] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [loadingViolations, setLoadingViolations] = useState(false);
+  const [videoUrl, setVideoUrl] = useState(null);
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [previewType, setPreviewType] = useState(null); // 'video' | 'graph'
+  const [previewUrl, setPreviewUrl] = useState(null);
+
+  useEffect(() => {
+    fetch(`${API}/api/runs`)
+      .then(r => r.json())
+      .then(d => {
+        const list = d.runs ?? [];
+        setRuns(list);
+        setLoading(false);
+        if (list.length > 0) selectRun(list[0]);
+      })
+      .catch(() => setLoading(false));
+  }, []);
+
+  const selectRun = async (run) => {
+    setSelectedRun(run);
+    setDropdownOpen(false);
+    setRunViolations([]);
+    setRunDetail(null);
+    setLoadingViolations(true);
+
+    try {
+      // Fetch all violations and filter by this run
+      const [vRes, rRes] = await Promise.all([
+        fetch(`${API}/api/violations`),
+        fetch(`${API}/api/runs/${run.run_id}`),
+      ]);
+      const vData = await vRes.json();
+      const rData = await rRes.json();
+      setRunViolations((vData.violations ?? []).filter(v => v.run_id === run.run_id));
+      setRunDetail(rData);
+    } catch (e) {
+      console.error('Failed to load run detail:', e);
+    } finally {
+      setLoadingViolations(false);
+    }
+  };
+
+  const formatDate = (ts) => ts
+    ? new Date(ts).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })
+    : '—';
+
+  const videoUrl2 = selectedRun ? `${API}/api/file/${selectedRun.run_id}/output.mp4` : null;
+  const graphUrl = selectedRun ? `${API}/api/file/${selectedRun.run_id}/speed_graph.png` : null;
+  const csvUrl = selectedRun ? `${API}/api/file/${selectedRun.run_id}/log.csv` : null;
+
+  return (
+    <div className="space-y-6">
+      {videoUrl && <VideoModal url={videoUrl} onClose={() => setVideoUrl(null)} />}
+
+      {/* Back button + title */}
+      <div className="flex items-center gap-4">
+        <button onClick={onBack}
+          className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-zinc-400 hover:text-white text-xs font-bold transition-all">
+          <ChevronLeft size={14} /> Back to All Alerts
+        </button>
+        <div>
+          <h2 className="text-xl font-extrabold text-white flex items-center gap-2">
+            <FolderOpen size={18} className="text-amber-400" /> Run Folder Browser
+          </h2>
+          <p className="text-xs text-zinc-500 mt-0.5">Browse violations and outputs per processing run</p>
+        </div>
+      </div>
+
+      {/* Run Selector Dropdown */}
+      <div className="relative">
+        <button
+          onClick={() => setDropdownOpen(o => !o)}
+          className="flex items-center gap-3 px-4 py-3 rounded-xl glass-card border border-white/10 text-sm text-white font-bold hover:border-white/20 transition min-w-[320px] justify-between">
+          <div className="flex items-center gap-2">
+            <FolderOpen size={16} className="text-amber-400" />
+            <span className="truncate">{selectedRun ? selectedRun.run_id : 'Select a run…'}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            {selectedRun && (
+              <span className="text-[10px] font-bold text-zinc-500">{formatDate(selectedRun.timestamp)}</span>
+            )}
+            <ChevronDown size={14} className={`text-zinc-500 transition-transform ${dropdownOpen ? 'rotate-180' : ''}`} />
+          </div>
+        </button>
+
+        {dropdownOpen && (
+          <div className="absolute left-0 top-full mt-2 w-96 glass-card border border-white/10 rounded-xl overflow-hidden z-20 shadow-2xl max-h-72 overflow-y-auto">
+            {loading ? (
+              <p className="text-xs text-zinc-500 p-4">Loading runs…</p>
+            ) : runs.length === 0 ? (
+              <p className="text-xs text-zinc-500 p-4">No runs found.</p>
+            ) : runs.map(r => (
+              <button key={r.run_id}
+                onClick={() => selectRun(r)}
+                className={`w-full text-left px-4 py-3 text-sm transition hover:bg-white/5 border-b border-white/5 last:border-0 ${selectedRun?.run_id === r.run_id ? 'text-amber-400 bg-amber-500/5' : 'text-zinc-300'}`}>
+                <div className="flex items-center justify-between">
+                  <p className="font-bold">{r.run_id}</p>
+                  <span className="text-[10px] text-zinc-600">{r.total_vehicles ?? 0} vehicles</span>
+                </div>
+                <p className="text-[10px] text-zinc-500 mt-0.5">{formatDate(r.timestamp)}</p>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {selectedRun && (
+        <div className="space-y-5">
+          {/* Run stats row */}
+          <div className="grid grid-cols-4 gap-4">
+            {[
+              { label: 'Total Vehicles', value: runDetail?.total_vehicles ?? '—', color: 'text-blue-400' },
+              { label: 'Avg Speed', value: runDetail?.avg_speed ? `${runDetail.avg_speed} km/h` : '—', color: 'text-emerald-400' },
+              { label: 'Max Speed', value: runDetail?.max_speed ? `${runDetail.max_speed} km/h` : '—', color: 'text-amber-400' },
+              { label: 'Violations', value: runViolations.length, color: 'text-rose-400' },
+            ].map(({ label, value, color }) => (
+              <div key={label} className="glass-card rounded-xl p-4 border border-white/5">
+                <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-2">{label}</p>
+                <p className={`text-2xl font-extrabold tabular-nums ${color}`}>{value}</p>
+              </div>
+            ))}
+          </div>
+
+          {/* Output files row */}
+          <div className="glass-card rounded-xl border border-white/5 overflow-hidden">
+            <div className="px-5 py-3 border-b border-white/5">
+              <p className="text-xs font-bold text-white uppercase tracking-widest">Run Output Files</p>
+            </div>
+            <div className="p-4 grid grid-cols-1 md:grid-cols-3 gap-4">
+              {/* Video */}
+              <div className="rounded-xl border border-white/10 overflow-hidden bg-white/[0.02]">
+                <div className="px-3 py-2 border-b border-white/5 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <FileVideo size={13} className="text-primary" />
+                    <span className="text-[10px] font-bold text-white uppercase tracking-wider">Output Video</span>
+                  </div>
+                  {videoUrl2 && (
+                    <div className="flex gap-1">
+                      <button onClick={() => setVideoUrl(`/api/file/${selectedRun.run_id}/output.mp4`)}
+                        className="px-2 py-1 rounded bg-primary/10 hover:bg-primary/20 text-primary text-[9px] font-bold border border-primary/20 transition flex items-center gap-1">
+                        <Play size={10} fill="currentColor" /> Play
+                      </button>
+                      <a href={videoUrl2} download
+                        className="px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-zinc-400 text-[9px] font-bold border border-white/10 transition flex items-center gap-1">
+                        <Download size={10} />
+                      </a>
+                    </div>
+                  )}
+                </div>
+                {videoUrl2 ? (
+                  <video src={videoUrl2} controls className="w-full" style={{ maxHeight: 160, background: '#000' }} />
+                ) : (
+                  <div className="flex items-center justify-center h-24 text-zinc-600 text-xs">Not available</div>
+                )}
+              </div>
+
+              {/* Speed Graph */}
+              <div className="rounded-xl border border-white/10 overflow-hidden bg-white/[0.02]">
+                <div className="px-3 py-2 border-b border-white/5 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <BarChart2 size={13} className="text-emerald-400" />
+                    <span className="text-[10px] font-bold text-white uppercase tracking-wider">Speed Graph</span>
+                  </div>
+                  {graphUrl && (
+                    <a href={graphUrl} download
+                      className="px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-zinc-400 text-[9px] font-bold border border-white/10 transition flex items-center gap-1">
+                      <Download size={10} /> Save
+                    </a>
+                  )}
+                </div>
+                {graphUrl ? (
+                  <img src={graphUrl} alt="Speed graph" className="w-full" style={{ maxHeight: 160, objectFit: 'cover' }} />
+                ) : (
+                  <div className="flex items-center justify-center h-24 text-zinc-600 text-xs">Not available</div>
+                )}
+              </div>
+
+              {/* CSV Log */}
+              <div className="rounded-xl border border-white/10 overflow-hidden bg-white/[0.02]">
+                <div className="px-3 py-2 border-b border-white/5 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <FileText size={13} className="text-amber-400" />
+                    <span className="text-[10px] font-bold text-white uppercase tracking-wider">Vehicle Log CSV</span>
+                  </div>
+                  {csvUrl && (
+                    <a href={csvUrl} download
+                      className="px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-zinc-400 text-[9px] font-bold border border-white/10 transition flex items-center gap-1">
+                      <Download size={10} /> Download
+                    </a>
+                  )}
+                </div>
+                <div className="flex flex-col items-center justify-center h-36 gap-3 p-4">
+                  <FileText size={28} className="text-zinc-600" />
+                  <p className="text-[11px] text-zinc-500 text-center font-medium">
+                    {csvUrl ? 'Vehicle-level detection log with speeds and timestamps.' : 'No CSV available for this run.'}
+                  </p>
+                  {csvUrl && (
+                    <a href={csvUrl} download
+                      className="px-4 py-2 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/20 text-amber-400 text-xs font-bold transition">
+                      Download CSV
+                    </a>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Violations for this run */}
+          <div className="glass-card rounded-xl border border-white/5 overflow-hidden">
+            <div className="px-5 py-3 border-b border-white/5 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <AlertTriangle size={14} className="text-danger" />
+                <p className="text-xs font-bold text-white uppercase tracking-widest">
+                  Overspeed Violations in This Run
+                </p>
+                <span className="px-2 py-0.5 rounded bg-white/5 text-[10px] font-bold text-zinc-500 border border-white/5">
+                  {runViolations.length}
+                </span>
+              </div>
+            </div>
+
+            <div className="p-4 space-y-3">
+              {loadingViolations ? (
+                Array.from({ length: 2 }).map((_, i) => (
+                  <div key={i} className="h-20 rounded-xl bg-white/5 animate-pulse" />
+                ))
+              ) : runViolations.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-12 text-center">
+                  <div className="w-12 h-12 rounded-xl bg-emerald-500/10 flex items-center justify-center mb-3 border border-emerald-500/20">
+                    <Check size={22} className="text-emerald-400" />
+                  </div>
+                  <p className="text-white font-bold">No violations in this run</p>
+                  <p className="text-zinc-500 text-xs mt-1">
+                    All vehicles were within the {speedLimit} km/h limit.
+                  </p>
+                </div>
+              ) : (
+                runViolations.map((v, i) => (
+                  <ViolationCard key={`${v.run_id}-${v.vehicle_id}-${i}`} v={v}
+                    onPlay={setVideoUrl} />
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -136,6 +372,7 @@ export default function OverspeedAlerts() {
   const [search, setSearch] = useState('');
   const [sortBy, setSortBy] = useState('speed');
   const [videoUrl, setVideoUrl] = useState(null);
+  const [mode, setMode] = useState('all'); // 'all' | 'runs'
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -219,99 +456,121 @@ export default function OverspeedAlerts() {
 
       <div className="flex-1 overflow-y-auto p-6 space-y-6">
 
-        {/* Page title + speed limit control */}
-        <div className="flex items-start justify-between">
+        {/* Page title + controls */}
+        <div className="flex items-start justify-between gap-4">
           <div>
             <h1 className="text-2xl font-extrabold text-white flex items-center gap-2">
               <AlertTriangle size={22} className="text-danger" /> Overspeed Alerts
             </h1>
             <p className="text-zinc-500 text-sm mt-1 font-medium">
-              {violations.length} total violation{violations.length !== 1 ? 's' : ''} detected across all processed runs
+              {violations.length} total violation{violations.length !== 1 ? 's' : ''} across all runs
             </p>
           </div>
 
-          <div className="glass-card rounded-xl p-4 border border-white/10 flex items-center gap-4 min-w-[320px]">
-            <div className="flex items-center gap-2">
-              <Settings2 size={16} className="text-primary" />
-              <span className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Speed Limit</span>
+          <div className="flex items-center gap-3 flex-wrap justify-end">
+            {/* Mode toggle */}
+            <div className="flex gap-1 p-1 bg-white/5 rounded-xl border border-white/5">
+              <button
+                onClick={() => setMode('all')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${mode === 'all' ? 'bg-danger/20 text-danger border border-danger/30' : 'text-zinc-400 hover:text-white'}`}>
+                <AlertTriangle size={12} /> All Alerts
+              </button>
+              <button
+                onClick={() => setMode('runs')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${mode === 'runs' ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30' : 'text-zinc-400 hover:text-white'}`}>
+                <FolderOpen size={12} /> Browse Runs
+              </button>
             </div>
-            <div className="flex items-center gap-2 ml-auto">
+
+            {/* Speed limit control */}
+            <div className="glass-card rounded-xl p-3 border border-white/10 flex items-center gap-3">
+              <div className="flex items-center gap-2">
+                <Settings2 size={14} className="text-primary" />
+                <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider">Limit</span>
+              </div>
               <input
                 type="number" min={10} max={300} value={inputLimit}
                 onChange={e => setInputLimit(Number(e.target.value))}
-                className="w-20 bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-white text-sm font-bold text-center focus:outline-none focus:ring-2 focus:ring-primary/50"
+                className="w-16 bg-white/5 border border-white/10 rounded-lg px-2 py-1 text-white text-sm font-bold text-center focus:outline-none focus:ring-2 focus:ring-primary/50"
               />
               <span className="text-xs text-zinc-500 font-bold">km/h</span>
               <button onClick={handleSaveLimit} disabled={saving || inputLimit === speedLimit}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-40 ${saved ? 'bg-success/20 text-success border border-success/30' : 'bg-primary/20 text-primary border border-primary/30 hover:bg-primary/30'}`}>
-                {saved ? <><Check size={12} /> Saved</> : saving ? 'Saving…' : 'Apply'}
+                className={`px-2.5 py-1 rounded-lg text-[10px] font-bold transition-all flex items-center gap-1 disabled:opacity-40 ${saved ? 'bg-success/20 text-success border border-success/30' : 'bg-primary/20 text-primary border border-primary/30 hover:bg-primary/30'}`}>
+                {saved ? <><Check size={11} /> Saved</> : saving ? '…' : 'Apply'}
               </button>
             </div>
           </div>
         </div>
 
-        {/* KPI Cards */}
-        <div className="grid grid-cols-4 gap-4">
-          {[
-            { label: 'Total Violations', value: violations.length, color: 'text-danger', icon: <AlertTriangle size={18} className="text-danger" /> },
-            { label: 'Critical (40+ over)', value: critical, color: 'text-rose-400', icon: <TrendingUp size={18} className="text-rose-400" /> },
-            { label: 'High (20–39 over)', value: high, color: 'text-orange-400', icon: <Gauge size={18} className="text-orange-400" /> },
-            { label: 'Avg Excess Speed', value: `+${avgExcess} km/h`, color: 'text-yellow-400', icon: <CarFront size={18} className="text-yellow-400" /> },
-          ].map(({ label, value, color, icon }) => (
-            <div key={label} className="glass-card rounded-xl p-4 border border-white/5">
-              <div className="flex items-center justify-between mb-3">
-                <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">{label}</span>
-                {icon}
-              </div>
-              <p className={`text-3xl font-extrabold tabular-nums ${color}`}>{value}</p>
-            </div>
-          ))}
-        </div>
-
-        {/* Violations list */}
-        <div className="glass-card rounded-xl border border-white/5 overflow-hidden">
-          <div className="flex items-center justify-between px-5 py-3 border-b border-white/5">
-            <p className="text-xs font-bold text-white">
-              {filtered.length} violation{filtered.length !== 1 ? 's' : ''}
-              {search && <span className="text-zinc-500"> matching "{search}"</span>}
-            </p>
-            <div className="flex items-center gap-1 text-[11px] font-bold text-zinc-500">
-              <span className="uppercase tracking-wider mr-1">Sort:</span>
-              {['speed', 'excess', 'time'].map(s => (
-                <button key={s} onClick={() => setSortBy(s)}
-                  className={`px-2 py-1 rounded-md uppercase tracking-wider transition-colors ${sortBy === s ? 'bg-primary/20 text-primary' : 'hover:text-white'}`}>
-                  {s}
-                </button>
+        {/* ── Run folder browser mode ────────────────────────────────────── */}
+        {mode === 'runs' ? (
+          <RunFolderBrowser onBack={() => setMode('all')} speedLimit={speedLimit} />
+        ) : (
+          <>
+            {/* KPI Cards */}
+            <div className="grid grid-cols-4 gap-4">
+              {[
+                { label: 'Total Violations', value: violations.length, color: 'text-danger', icon: <AlertTriangle size={18} className="text-danger" /> },
+                { label: 'Critical (40+ over)', value: critical, color: 'text-rose-400', icon: <TrendingUp size={18} className="text-rose-400" /> },
+                { label: 'High (20–39 over)', value: high, color: 'text-orange-400', icon: <Gauge size={18} className="text-orange-400" /> },
+                { label: 'Avg Excess Speed', value: `+${avgExcess} km/h`, color: 'text-yellow-400', icon: <CarFront size={18} className="text-yellow-400" /> },
+              ].map(({ label, value, color, icon }) => (
+                <div key={label} className="glass-card rounded-xl p-4 border border-white/5">
+                  <div className="flex items-center justify-between mb-3">
+                    <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">{label}</span>
+                    {icon}
+                  </div>
+                  <p className={`text-3xl font-extrabold tabular-nums ${color}`}>{value}</p>
+                </div>
               ))}
             </div>
-          </div>
 
-          <div className="p-4 space-y-3">
-            {loading ? (
-              Array.from({ length: 3 }).map((_, i) => (
-                <div key={i} className="h-24 rounded-xl bg-white/5 animate-pulse" />
-              ))
-            ) : filtered.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-20 text-center">
-                <div className="w-16 h-16 rounded-2xl bg-white/5 flex items-center justify-center mb-4">
-                  <AlertTriangle size={28} className="text-zinc-600" />
+            {/* Violations list */}
+            <div className="glass-card rounded-xl border border-white/5 overflow-hidden">
+              <div className="flex items-center justify-between px-5 py-3 border-b border-white/5">
+                <p className="text-xs font-bold text-white">
+                  {filtered.length} violation{filtered.length !== 1 ? 's' : ''}
+                  {search && <span className="text-zinc-500"> matching "{search}"</span>}
+                </p>
+                <div className="flex items-center gap-1 text-[11px] font-bold text-zinc-500">
+                  <span className="uppercase tracking-wider mr-1">Sort:</span>
+                  {['speed', 'excess', 'time'].map(s => (
+                    <button key={s} onClick={() => setSortBy(s)}
+                      className={`px-2 py-1 rounded-md uppercase tracking-wider transition-colors ${sortBy === s ? 'bg-primary/20 text-primary' : 'hover:text-white'}`}>
+                      {s}
+                    </button>
+                  ))}
                 </div>
-                <p className="text-white font-bold text-lg">
-                  {violations.length === 0 ? 'No violations detected' : 'No results match your search'}
-                </p>
-                <p className="text-zinc-500 text-sm mt-1 max-w-xs font-medium">
-                  {violations.length === 0
-                    ? `No vehicles exceeded ${speedLimit} km/h across all processed runs.`
-                    : 'Try adjusting your search filter.'}
-                </p>
               </div>
-            ) : (
-              filtered.map((v, i) => (
-                <ViolationCard key={`${v.run_id}-${v.vehicle_id}-${i}`} v={v} onPlay={setVideoUrl} />
-              ))
-            )}
-          </div>
-        </div>
+
+              <div className="p-4 space-y-3">
+                {loading ? (
+                  Array.from({ length: 3 }).map((_, i) => (
+                    <div key={i} className="h-24 rounded-xl bg-white/5 animate-pulse" />
+                  ))
+                ) : filtered.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center py-20 text-center">
+                    <div className="w-16 h-16 rounded-2xl bg-white/5 flex items-center justify-center mb-4">
+                      <AlertTriangle size={28} className="text-zinc-600" />
+                    </div>
+                    <p className="text-white font-bold text-lg">
+                      {violations.length === 0 ? 'No violations detected' : 'No results match your search'}
+                    </p>
+                    <p className="text-zinc-500 text-sm mt-1 max-w-xs font-medium">
+                      {violations.length === 0
+                        ? `No vehicles exceeded ${speedLimit} km/h across all runs.`
+                        : 'Try adjusting your search filter.'}
+                    </p>
+                  </div>
+                ) : (
+                  filtered.map((v, i) => (
+                    <ViolationCard key={`${v.run_id}-${v.vehicle_id}-${i}`} v={v} onPlay={setVideoUrl} />
+                  ))
+                )}
+              </div>
+            </div>
+          </>
+        )}
       </div>
 
       {videoUrl && <VideoModal url={videoUrl} onClose={() => setVideoUrl(null)} />}
