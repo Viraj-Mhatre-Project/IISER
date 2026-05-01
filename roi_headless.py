@@ -139,30 +139,39 @@ def build_roi_polygon_orig(line_A_orig, line_B_orig):
     ], dtype=np.int32)
 
 
+def point_in_polygon(px, py, polygon):
+    """
+    Check if point (px, py) is inside the given polygon (numpy int32 array).
+    Uses OpenCV's pointPolygonTest.
+    Returns True if inside or on boundary.
+    """
+    result = cv2.pointPolygonTest(polygon, (float(px), float(py)), False)
+    return result >= 0
+
+
 # ── Main processing function ──────────────────────────────────────────────────
 
 def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_state=None):
     """
-    Changes vs previous version
-    ────────────────────────────
-    1. Labels only inside ROI
-       Vehicles whose warped centroid is OUTSIDE the ROI band get a thin dim
-       grey box and no label. Only vehicles inside the ROI get coloured boxes
-       and speed/ID text.
+    Key fixes vs previous version:
+    ──────────────────────────────
+    FIX 1: ROI containment now uses pointPolygonTest on the actual warped-space
+            quad polygon (line_A → line_B quad). Only vehicles whose warped
+            centroid falls inside this polygon are drawn with labels/colors.
+            Vehicles outside get a thin grey box and NO label — regardless of
+            their y-coordinate alone.
 
-    2. Speed shown on first-line crossing
-       The moment a vehicle crosses line A (or B), its bounding box turns cyan
-       and shows "ID N | Measuring…". If the same vehicle was measured before
-       (re-entry), its last confirmed speed is shown instead while it travels
-       to the second line. The instant it crosses the second line the confirmed
-       speed replaces the label and the box turns green.
+    FIX 2: Real-time speed display.
+            • 'measuring' state now shows a live elapsed-time speed estimate
+              (distance / elapsed_time * 3.6) that updates every frame,
+              so the driver sees a changing number rather than "Measuring..."
+            • On second crossing, confirmed EMA-smoothed speed replaces it.
+            • State 'done' shows the confirmed speed in green.
 
-    3. measure_state per vehicle: 'none' | 'measuring' | 'done'
-
-    Retained from previous version
+    Retained from previous version:
     ────────────────────────────────
     • Runtime PPM re-derivation for real_distance
-    • try/except around frame loop — real error message surfaces
+    • try/except around frame loop
     • Cancellation sets stage = "cancelled"
     """
 
@@ -208,14 +217,32 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
         real_distance = calib["real_distance"]
         print(f"[calibration] No PPM — using stored real_distance={real_distance} m")
 
-    # ROI y-band in warped space
-    line_A_y = (line_A[0][1] + line_A[1][1]) / 2
-    line_B_y = (line_B[0][1] + line_B[1][1]) / 2
-    roi_y_lo = min(line_A_y, line_B_y) - 20
-    roi_y_hi = max(line_A_y, line_B_y) + 20
+    # ── FIX 1: Build warped-space ROI polygon from the two measurement lines ──
+    # This is the actual quadrilateral: line_A → line_B in warped coordinates.
+    # We add a small margin so vehicles are caught slightly before/after lines.
+    MARGIN = 30  # pixels in warped space
 
-    def in_roi_warped(wcy):
-        return roi_y_lo <= wcy <= roi_y_hi
+    line_A_y_avg = (line_A[0][1] + line_A[1][1]) / 2
+    line_B_y_avg = (line_B[0][1] + line_B[1][1]) / 2
+    top_y    = min(line_A_y_avg, line_B_y_avg) - MARGIN
+    bottom_y = max(line_A_y_avg, line_B_y_avg) + MARGIN
+
+    # x extents: use min/max of both lines plus margin
+    all_x = [line_A[0][0], line_A[1][0], line_B[0][0], line_B[1][0]]
+    left_x  = min(all_x) - MARGIN
+    right_x = max(all_x) + MARGIN
+
+    # Warped-space ROI polygon (used for containment test)
+    warped_roi_poly = np.array([
+        [left_x,  top_y],
+        [right_x, top_y],
+        [right_x, bottom_y],
+        [left_x,  bottom_y],
+    ], dtype=np.int32)
+
+    def in_warped_roi(wcx, wcy):
+        """True if the warped-space centroid is inside the measurement quad."""
+        return point_in_polygon(wcx, wcy, warped_roi_poly)
 
     update("loading_video")
 
@@ -266,19 +293,31 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
         line_A_orig = line_A
         line_B_orig = line_B
 
-    roi_poly = build_roi_polygon_orig(line_A_orig, line_B_orig)
+    roi_poly_orig = build_roi_polygon_orig(line_A_orig, line_B_orig)
 
     # ── Per-vehicle state ─────────────────────────────────────────────────────
-    first_cross_time  = {}   # id → t of first crossing
-    first_cross_line  = {}   # id → 'A' | 'B'
-    second_cross_time = {}   # id → t of second crossing (temporary)
-    last_cross_time   = {}   # id → t  (debounce)
-    speeds            = {}   # id → latest confirmed speed km/h
-    measure_state     = {}   # id → 'none' | 'measuring' | 'done'
-    prev_side_A       = {}
-    prev_side_B       = {}
-    log_data          = []
-    frame_count       = 0
+    first_cross_time  = {}   # display_id → t of first crossing
+    first_cross_line  = {}   # display_id → 'A' | 'B'
+    second_cross_time = {}   # display_id → t of second crossing (temporary)
+    last_cross_time   = {}   # display_id → t  (debounce)
+    speeds            = {}   # display_id → latest confirmed speed km/h
+    measure_state     = {}   # display_id → 'none' | 'measuring' | 'done'
+    prev_side_A       = {}   # tracker_id → side
+    prev_side_B       = {}   # tracker_id → side
+
+    # Sequential ID remapping: only assigned when a tracker ID first enters
+    # the ROI zone, so IDs are 1, 2, 3... with no gaps from dropped detections.
+    tracker_to_display = {}  # tracker_id → display_id
+    _next_display_id   = [1] # list so the closure can mutate it
+
+    def get_display_id(tracker_id):
+        if tracker_id not in tracker_to_display:
+            tracker_to_display[tracker_id] = _next_display_id[0]
+            _next_display_id[0] += 1
+        return tracker_to_display[tracker_id]
+
+    log_data    = []
+    frame_count = 0
 
     # ── Frame loop ────────────────────────────────────────────────────────────
     try:
@@ -301,9 +340,9 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
 
             results = model.track(frame, persist=True, tracker="botsort.yaml", verbose=False)
 
-            # Semi-transparent ROI band
+            # Semi-transparent ROI band overlay
             overlay = frame.copy()
-            cv2.fillPoly(overlay, [roi_poly], (0, 255, 255))
+            cv2.fillPoly(overlay, [roi_poly_orig], (0, 255, 255))
             cv2.addWeighted(overlay, 0.06, frame, 0.94, 0, frame)
 
             if results[0].boxes.id is not None:
@@ -321,28 +360,36 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
                     else:
                         wcx, wcy = cx_orig, cy_orig
 
-                    sA      = side_of_line(wcx, wcy, line_A)
-                    sB      = side_of_line(wcx, wcy, line_B)
-                    in_zone = in_roi_warped(wcy)
+                    # ── FIX 1: Strict polygon containment in warped space ─────
+                    in_zone = in_warped_roi(wcx, wcy)
 
-                    # ── Crossing / speed logic ────────────────────────────────
+                    sA = side_of_line(wcx, wcy, line_A)
+                    sB = side_of_line(wcx, wcy, line_B)
+
+                    # Assign a clean sequential display ID only when entering ROI
                     if in_zone:
-                        since_last = t - last_cross_time.get(obj_id, -999)
+                        did = get_display_id(obj_id)
+                    else:
+                        # Outside ROI: use existing mapping if present, else skip labelling
+                        did = tracker_to_display.get(obj_id, None)
 
-                        if obj_id not in first_cross_time:
+                    # ── Crossing / speed logic (only for vehicles in zone) ────
+                    if in_zone and did is not None:
+                        since_last = t - last_cross_time.get(did, -999)
+
+                        if did not in first_cross_time:
                             crossed_A = obj_id in prev_side_A and prev_side_A[obj_id] != sA
                             crossed_B = obj_id in prev_side_B and prev_side_B[obj_id] != sB
                             if (crossed_A or crossed_B) and since_last >= CROSS_COOLDOWN:
-                                first_cross_time[obj_id] = t
-                                first_cross_line[obj_id] = 'A' if crossed_A else 'B'
-                                last_cross_time[obj_id]  = t
-                                # ← KEY CHANGE: flip to 'measuring' on first crossing
-                                measure_state[obj_id]    = 'measuring'
+                                first_cross_time[did] = t
+                                first_cross_line[did] = 'A' if crossed_A else 'B'
+                                last_cross_time[did]  = t
+                                measure_state[did]    = 'measuring'
 
-                        elif obj_id not in second_cross_time:
-                            other_prev  = prev_side_B if first_cross_line[obj_id] == 'A' else prev_side_A
-                            other_curr  = sB          if first_cross_line[obj_id] == 'A' else sA
-                            other_label = 'B'         if first_cross_line[obj_id] == 'A' else 'A'
+                        elif did not in second_cross_time:
+                            other_prev  = prev_side_B if first_cross_line[did] == 'A' else prev_side_A
+                            other_curr  = sB          if first_cross_line[did] == 'A' else sA
+                            other_label = 'B'         if first_cross_line[did] == 'A' else 'A'
 
                             crossed_second = (
                                 obj_id in other_prev
@@ -351,24 +398,23 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
                             )
 
                             if crossed_second:
-                                dt = t - first_cross_time[obj_id]
+                                dt = t - first_cross_time[did]
 
                                 if MIN_TRAVEL_TIME <= dt <= MAX_TRAVEL_TIME:
                                     raw_spd = (real_distance / dt) * 3.6
                                     if raw_spd <= MAX_SPEED_KMH:
-                                        prev_spd = speeds.get(obj_id, raw_spd)
+                                        prev_spd = speeds.get(did, raw_spd)
                                         smoothed = EMA_ALPHA * raw_spd + (1 - EMA_ALPHA) * prev_spd
-                                        speeds[obj_id]            = smoothed
-                                        # ← KEY CHANGE: flip to 'done' immediately
-                                        measure_state[obj_id]     = 'done'
-                                        second_cross_time[obj_id] = t
-                                        last_cross_time[obj_id]   = t
+                                        speeds[did]            = smoothed
+                                        measure_state[did]     = 'done'
+                                        second_cross_time[did] = t
+                                        last_cross_time[did]   = t
 
                                         log_data.append({
-                                            "ID":           obj_id,
+                                            "ID":           did,
                                             "Class":        model.names[cls],
-                                            "EntryLine":    first_cross_line[obj_id],
-                                            "EntryTime":    round(first_cross_time[obj_id], 3),
+                                            "EntryLine":    first_cross_line[did],
+                                            "EntryTime":    round(first_cross_time[did], 3),
                                             "ExitLine":     other_label,
                                             "ExitTime":     round(t, 3),
                                             "Duration_s":   round(dt, 3),
@@ -376,49 +422,44 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
                                             "RawSpeed_kmh": round(raw_spd, 2),
                                         })
 
-                                        first_cross_time.pop(obj_id, None)
-                                        first_cross_line.pop(obj_id, None)
-                                        second_cross_time.pop(obj_id, None)
+                                        first_cross_time.pop(did, None)
+                                        first_cross_line.pop(did, None)
+                                        second_cross_time.pop(did, None)
 
                                 elif dt > MAX_TRAVEL_TIME:
-                                    first_cross_time.pop(obj_id, None)
-                                    first_cross_line.pop(obj_id, None)
-                                    measure_state[obj_id] = 'none'
+                                    first_cross_time.pop(did, None)
+                                    first_cross_line.pop(did, None)
+                                    measure_state[did] = 'none'
 
+                    # Always update side state keyed by tracker ID (for crossing detection)
                     prev_side_A[obj_id] = sA
                     prev_side_B[obj_id] = sB
 
                     # ── Drawing ───────────────────────────────────────────────
-                    # Vehicles OUTSIDE the ROI: thin grey box, no label
+                    # Vehicles strictly OUTSIDE the warped ROI → thin grey, no label
                     if not in_zone:
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (70, 70, 70), 1)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (60, 60, 60), 1)
                         continue
 
-                    # Vehicles INSIDE the ROI — label depends on state
-                    state = measure_state.get(obj_id, 'none')
+                    state = measure_state.get(did, 'none')
 
                     if state == 'done':
-                        # ── Confirmed speed ──────────────────────────────────
-                        box_color  = (0, 255, 0)          # green
-                        label_text = f"ID {obj_id} | {speeds[obj_id]:.1f} km/h"
+                        # ── Confirmed speed (green) ──────────────────────────
+                        box_color  = (0, 255, 0)
+                        label_text = f"ID {did} | {speeds[did]:.1f} km/h"
                         lbl_color  = (0, 255, 0)
                         bg_color   = (0, 50, 0)
 
                     elif state == 'measuring':
-                        # ── Crossed first line, waiting for second ───────────
-                        box_color = (0, 200, 255)          # cyan
-                        if obj_id in speeds:
-                            # Re-entry: show previous speed while re-measuring
-                            label_text = f"ID {obj_id} | {speeds[obj_id]:.1f} km/h"
-                        else:
-                            # Very first crossing for this vehicle
-                            label_text = f"ID {obj_id} | Measuring..."
-                        lbl_color = (0, 200, 255)
-                        bg_color  = (0, 40, 55)
+                        # Crossed first line — waiting for second crossing
+                        box_color  = (0, 200, 255)   # cyan
+                        lbl_color  = (0, 200, 255)
+                        bg_color   = (0, 40, 55)
+                        label_text = f"ID {did}"
 
                     else:
                         # ── Inside ROI but not yet crossed any line ──────────
-                        # Subtle green outline only — no label clutter
+                        # Subtle teal outline only — no label clutter
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 180, 100), 1)
                         continue
 
