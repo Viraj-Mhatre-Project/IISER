@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Search, Bell, AlertTriangle, Gauge, CarFront, Clock, TrendingUp, ChevronDown, X, Play, Settings2, Check, RefreshCw } from 'lucide-react';
+import { Search, Bell, AlertTriangle, Gauge, CarFront, Clock, TrendingUp, X, Play, Settings2, Check, RefreshCw } from 'lucide-react';
 
 const API = 'http://localhost:8000';
 
@@ -19,6 +19,23 @@ function severityLabel(excess) {
 function fmtTime(isoStr) {
   if (!isoStr) return '—';
   return new Date(isoStr).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+/**
+ * Formats the vehicle identity label:
+ *   - "car" / "motorcycle" / "bicycle" → generic  →  "VEHICLE ID: 42"
+ *   - anything else (truck, bus, van…) → specific  →  "TRUCK · ID: 42"
+ *
+ * The class name from YOLO is lowercase (e.g. "truck", "bus", "car").
+ */
+const GENERIC_CLASSES = new Set(['car', 'motorcycle', 'bicycle', 'motorbike']);
+
+function vehicleLabel(vehicleClass, vehicleId) {
+  const cls = (vehicleClass ?? '').toLowerCase().trim();
+  if (!cls || GENERIC_CLASSES.has(cls)) {
+    return { prefix: 'VEHICLE', id: `ID: ${vehicleId}`, isGeneric: true };
+  }
+  return { prefix: cls.toUpperCase(), id: `ID: ${vehicleId}`, isGeneric: false };
 }
 
 // ── VideoModal ────────────────────────────────────────────────────────────────
@@ -45,21 +62,27 @@ function VideoModal({ url, onClose }) {
 function ViolationCard({ v, onPlay }) {
   const col = severityColor(v.excess_kmh);
   const label = severityLabel(v.excess_kmh);
+  const { prefix, id } = vehicleLabel(v.vehicle_class, v.vehicle_id);
 
   return (
     <div className={`glass-card rounded-xl p-4 border ${col.border} ${col.bg} flex items-start gap-4 transition-all hover:scale-[1.01]`}>
-      {/* Severity badge */}
+      {/* Severity stripe */}
       <div className={`shrink-0 mt-0.5 w-2 h-full min-h-[60px] rounded-full ${col.badge} opacity-80`} />
 
       <div className="flex-1 min-w-0 space-y-2">
         {/* Top row */}
         <div className="flex flex-wrap items-center gap-2">
+          {/* Severity badge */}
           <span className={`text-[10px] font-black uppercase tracking-widest px-2 py-0.5 rounded-md border ${col.border} ${col.text}`}>
             {label}
           </span>
-          <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider">
-            {v.vehicle_class} · ID {v.vehicle_id}
+
+          {/* Vehicle identity — key change */}
+          <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider">
+            {prefix}
+            <span className="text-zinc-500 font-semibold"> · {id}</span>
           </span>
+
           <span className="ml-auto text-[10px] text-zinc-600 font-medium">{fmtTime(v.timestamp)}</span>
         </div>
 
@@ -88,7 +111,7 @@ function ViolationCard({ v, onPlay }) {
         </div>
       </div>
 
-      {/* Play Button */}
+      {/* Play button */}
       <button
         onClick={() => onPlay(v.video_url)}
         className="shrink-0 flex flex-col items-center gap-1 group"
@@ -111,10 +134,9 @@ export default function OverspeedAlerts() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [search, setSearch] = useState('');
-  const [sortBy, setSortBy] = useState('speed'); // 'speed' | 'time' | 'excess'
+  const [sortBy, setSortBy] = useState('speed');
   const [videoUrl, setVideoUrl] = useState(null);
 
-  // Fetch violations & current limit
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
@@ -136,7 +158,6 @@ export default function OverspeedAlerts() {
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
-  // Save new speed limit
   const handleSaveLimit = async () => {
     if (inputLimit < 10 || inputLimit > 300) return;
     setSaving(true);
@@ -148,7 +169,6 @@ export default function OverspeedAlerts() {
       setSpeedLimit(data.speed_limit);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
-      // Reload violations with new limit applied
       await fetchData();
     } catch (e) {
       alert('Error saving speed limit: ' + e.message);
@@ -157,7 +177,6 @@ export default function OverspeedAlerts() {
     }
   };
 
-  // Filter + sort
   const filtered = violations
     .filter(v =>
       v.run_id.toLowerCase().includes(search.toLowerCase()) ||
@@ -172,7 +191,6 @@ export default function OverspeedAlerts() {
 
   const critical = violations.filter(v => v.excess_kmh >= 40).length;
   const high = violations.filter(v => v.excess_kmh >= 20 && v.excess_kmh < 40).length;
-  const moderate = violations.filter(v => v.excess_kmh < 20).length;
   const avgExcess = violations.length
     ? (violations.reduce((a, v) => a + v.excess_kmh, 0) / violations.length).toFixed(1)
     : 0;
@@ -201,7 +219,7 @@ export default function OverspeedAlerts() {
 
       <div className="flex-1 overflow-y-auto p-6 space-y-6">
 
-        {/* Page title strip */}
+        {/* Page title + speed limit control */}
         <div className="flex items-start justify-between">
           <div>
             <h1 className="text-2xl font-extrabold text-white flex items-center gap-2">
@@ -212,7 +230,6 @@ export default function OverspeedAlerts() {
             </p>
           </div>
 
-          {/* Speed Limit Control */}
           <div className="glass-card rounded-xl p-4 border border-white/10 flex items-center gap-4 min-w-[320px]">
             <div className="flex items-center gap-2">
               <Settings2 size={16} className="text-primary" />
@@ -251,15 +268,13 @@ export default function OverspeedAlerts() {
           ))}
         </div>
 
-        {/* Violations List */}
+        {/* Violations list */}
         <div className="glass-card rounded-xl border border-white/5 overflow-hidden">
-          {/* List header */}
           <div className="flex items-center justify-between px-5 py-3 border-b border-white/5">
             <p className="text-xs font-bold text-white">
               {filtered.length} violation{filtered.length !== 1 ? 's' : ''}
               {search && <span className="text-zinc-500"> matching "{search}"</span>}
             </p>
-            {/* Sort */}
             <div className="flex items-center gap-1 text-[11px] font-bold text-zinc-500">
               <span className="uppercase tracking-wider mr-1">Sort:</span>
               {['speed', 'excess', 'time'].map(s => (
@@ -271,7 +286,6 @@ export default function OverspeedAlerts() {
             </div>
           </div>
 
-          {/* List body */}
           <div className="p-4 space-y-3">
             {loading ? (
               Array.from({ length: 3 }).map((_, i) => (
@@ -300,7 +314,6 @@ export default function OverspeedAlerts() {
         </div>
       </div>
 
-      {/* Video Modal */}
       {videoUrl && <VideoModal url={videoUrl} onClose={() => setVideoUrl(null)} />}
     </div>
   );
