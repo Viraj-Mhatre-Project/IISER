@@ -13,6 +13,7 @@ import gdown
 import json
 import glob
 import logging
+import math
 
 logging.getLogger("ultralytics").setLevel(logging.ERROR)
 
@@ -40,7 +41,6 @@ def download_from_drive(link):
 # ── Codec / writer helpers ────────────────────────────────────────────────────
 
 def _ffmpeg_available():
-    """Return True if ffmpeg is on PATH."""
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
         return True
@@ -49,7 +49,6 @@ def _ffmpeg_available():
 
 
 def _avc1_available(width, height, fps):
-    """Return True if OpenCV can open a VideoWriter with avc1."""
     try:
         tmp = "__codec_test__.mp4"
         writer = cv2.VideoWriter(tmp, cv2.VideoWriter_fourcc(*'avc1'),
@@ -64,12 +63,6 @@ def _avc1_available(width, height, fps):
 
 
 def make_writer(path, fps, width, height):
-    """
-    Choose the best available codec in order:
-      1. avc1  (H.264 via OpenCV — works on most Windows/macOS builds)
-      2. mp4v  (fallback raw — will be re-encoded by ffmpeg after processing)
-    Returns (writer, used_codec).
-    """
     if _avc1_available(width, height, fps):
         print("[codec] Using avc1 (H.264) directly.")
         return (cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'avc1'), fps, (width, height)),
@@ -80,16 +73,9 @@ def make_writer(path, fps, width, height):
 
 
 def reencode_h264(mp4_path):
-    """
-    Re-encode an mp4v file to H.264 using ffmpeg.
-    Replaces the original file in-place.
-    Returns True on success, False if ffmpeg is unavailable or fails.
-    """
     if not _ffmpeg_available():
         print("[codec] ffmpeg not found — video may not play in browser.")
-        print("[codec] Install ffmpeg and add it to PATH to fix this.")
         return False
-
     tmp = mp4_path.replace(".mp4", "_raw.mp4")
     try:
         os.rename(mp4_path, tmp)
@@ -104,7 +90,7 @@ def reencode_h264(mp4_path):
         )
         if result.returncode != 0:
             print(f"[codec] ffmpeg failed:\n{result.stderr}")
-            os.rename(tmp, mp4_path)   # restore original
+            os.rename(tmp, mp4_path)
             return False
         os.remove(tmp)
         print("[codec] Re-encoded to H.264 successfully.")
@@ -116,7 +102,7 @@ def reencode_h264(mp4_path):
         return False
 
 
-# ── Main processing function ──────────────────────────────────────────────────
+# ── Geometry helpers ──────────────────────────────────────────────────────────
 
 def side_of_line(cx, cy, line):
     (x1, y1), (x2, y2) = line
@@ -124,11 +110,12 @@ def side_of_line(cx, cy, line):
     return 1 if val >= 0 else -1
 
 
-def draw_label(frame, x1, y1, text, color=(0, 255, 255)):
+def draw_label(frame, x1, y1, text, color=(0, 255, 255), bg_color=(0, 0, 0)):
     font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1
     (tw, th), bl = cv2.getTextSize(text, font, scale, thick)
-    lx, ly = max(x1, 2), max(y1 - 4, th + 6)
-    cv2.rectangle(frame, (lx - 2, ly - th - 4), (lx + tw + 4, ly + bl + 2), (0, 0, 0), -1)
+    lx = max(x1, 2)
+    ly = max(y1 - 4, th + 6)
+    cv2.rectangle(frame, (lx - 2, ly - th - 4), (lx + tw + 4, ly + bl + 2), bg_color, -1)
     cv2.putText(frame, text, (lx, ly - 2), font, scale, color, thick, cv2.LINE_AA)
 
 
@@ -138,14 +125,45 @@ def project_point(pt, H):
     return float(warped[0][0][0]), float(warped[0][0][1])
 
 
+def _line_midpoint(a, b):
+    return ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
+
+
+def build_roi_polygon_orig(line_A_orig, line_B_orig):
+    """Quad between the two lines in original-frame coordinates."""
+    return np.array([
+        line_A_orig[0],
+        line_A_orig[1],
+        line_B_orig[1],
+        line_B_orig[0],
+    ], dtype=np.int32)
+
+
+# ── Main processing function ──────────────────────────────────────────────────
+
 def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_state=None):
     """
-    Detect & track on the ORIGINAL frame.
-    Project centroids into warped space for line-crossing logic.
-    Output video is H.264 — browser-playable on any device.
-    Strategy:
-      • Try avc1 first (no ffmpeg needed).
-      • Fall back to mp4v + ffmpeg re-encode if avc1 is unavailable.
+    Changes vs previous version
+    ────────────────────────────
+    1. Labels only inside ROI
+       Vehicles whose warped centroid is OUTSIDE the ROI band get a thin dim
+       grey box and no label. Only vehicles inside the ROI get coloured boxes
+       and speed/ID text.
+
+    2. Speed shown on first-line crossing
+       The moment a vehicle crosses line A (or B), its bounding box turns cyan
+       and shows "ID N | Measuring…". If the same vehicle was measured before
+       (re-entry), its last confirmed speed is shown instead while it travels
+       to the second line. The instant it crosses the second line the confirmed
+       speed replaces the label and the box turns green.
+
+    3. measure_state per vehicle: 'none' | 'measuring' | 'done'
+
+    Retained from previous version
+    ────────────────────────────────
+    • Runtime PPM re-derivation for real_distance
+    • try/except around frame loop — real error message surfaces
+    • Cancellation sets stage = "cancelled"
     """
 
     def update(stage=None, **kwargs):
@@ -158,6 +176,7 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
     # ── Calibration ───────────────────────────────────────────────────────────
     if not os.path.exists("calibration.json"):
         print("ERROR: calibration.json not found.")
+        update("error", error="calibration.json not found")
         return None
 
     with open("calibration.json", "r") as f:
@@ -168,14 +187,28 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
         H            = np.array(calib["homography"]["matrix"], dtype="float64")
         H_inv        = np.linalg.inv(H)
         dst_w, dst_h = calib["homography"]["dst_size"]
+        ppm          = calib["homography"].get("ppm", None)
     else:
         H = H_inv = None
         dst_w = dst_h = None
+        ppm = None
 
-    line_A        = tuple(map(tuple, calib["line_A"]))
-    line_B        = tuple(map(tuple, calib["line_B"]))
-    real_distance = calib["real_distance"]
+    line_A = tuple(map(tuple, calib["line_A"]))
+    line_B = tuple(map(tuple, calib["line_B"]))
 
+    # ── Runtime real_distance re-derivation ──────────────────────────────────
+    if ppm is not None and ppm > 0:
+        mp_a = _line_midpoint(line_A[0], line_A[1])
+        mp_b = _line_midpoint(line_B[0], line_B[1])
+        pixel_gap     = math.hypot(mp_b[0] - mp_a[0], mp_b[1] - mp_a[1])
+        real_distance = pixel_gap / ppm
+        print(f"[calibration] PPM={ppm}  pixel_gap={pixel_gap:.2f}  "
+              f"real_distance={real_distance:.4f} m  (runtime re-derived)")
+    else:
+        real_distance = calib["real_distance"]
+        print(f"[calibration] No PPM — using stored real_distance={real_distance} m")
+
+    # ROI y-band in warped space
     line_A_y = (line_A[0][1] + line_A[1][1]) / 2
     line_B_y = (line_B[0][1] + line_B[1][1]) / 2
     roi_y_lo = min(line_A_y, line_B_y) - 20
@@ -188,7 +221,7 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print("Error reading video.")
+        update("error", error="Could not open video file")
         return None
 
     fps          = cap.get(cv2.CAP_PROP_FPS)
@@ -216,17 +249,15 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
 
     run_dir  = f"{save_dir}/{run_name}"
     os.makedirs(run_dir, exist_ok=True)
-
     mp4_path = f"{run_dir}/output.mp4"
 
-    # ── Pick best codec for this device ──────────────────────────────────────
     writer, used_codec = make_writer(mp4_path, fps, out_w, out_h)
 
-    # ── Back-project warped lines to original frame for drawing ──────────────
+    # Back-project warped line coords → original frame for drawing
     def warp_to_orig(pt):
         p = np.array([[[float(pt[0]), float(pt[1])]]], dtype="float32")
-        orig = cv2.perspectiveTransform(p, H_inv)
-        return (int(orig[0][0][0]), int(orig[0][0][1]))
+        o = cv2.perspectiveTransform(p, H_inv)
+        return (int(o[0][0][0]), int(o[0][0][1]))
 
     if has_homography:
         line_A_orig = (warp_to_orig(line_A[0]), warp_to_orig(line_A[1]))
@@ -235,133 +266,188 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
         line_A_orig = line_A
         line_B_orig = line_B
 
+    roi_poly = build_roi_polygon_orig(line_A_orig, line_B_orig)
+
     # ── Per-vehicle state ─────────────────────────────────────────────────────
-    first_cross_time  = {}
-    first_cross_line  = {}
-    second_cross_time = {}
-    last_cross_time   = {}
-    speeds            = {}
+    first_cross_time  = {}   # id → t of first crossing
+    first_cross_line  = {}   # id → 'A' | 'B'
+    second_cross_time = {}   # id → t of second crossing (temporary)
+    last_cross_time   = {}   # id → t  (debounce)
+    speeds            = {}   # id → latest confirmed speed km/h
+    measure_state     = {}   # id → 'none' | 'measuring' | 'done'
     prev_side_A       = {}
     prev_side_B       = {}
     log_data          = []
     frame_count       = 0
 
-    while True:
-        if progress_state is not None and progress_state.get("cancelled", False):
-            print("Processing cancelled by user.")
-            cap.release()
-            writer.release()
-            return None
+    # ── Frame loop ────────────────────────────────────────────────────────────
+    try:
+        while True:
+            # Cancellation
+            if progress_state is not None and progress_state.get("cancelled", False):
+                print("Processing cancelled by user.")
+                cap.release()
+                writer.release()
+                progress_state["stage"] = "cancelled"
+                return None
 
-        ret, frame = cap.read()
-        if not ret:
-            break
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        update(extracted_frames=frame_count + 1)
-        t = frame_count / fps
-        update("detecting")
+            update(extracted_frames=frame_count + 1)
+            t = frame_count / fps
+            update("detecting")
 
-        results = model.track(frame, persist=True, tracker="botsort.yaml", verbose=False)
+            results = model.track(frame, persist=True, tracker="botsort.yaml", verbose=False)
 
-        if results[0].boxes.id is not None:
-            boxes = results[0].boxes.xyxy.cpu().numpy()
-            ids   = results[0].boxes.id.cpu().numpy().astype(int)
-            clss  = results[0].boxes.cls.cpu().numpy().astype(int)
+            # Semi-transparent ROI band
+            overlay = frame.copy()
+            cv2.fillPoly(overlay, [roi_poly], (0, 255, 255))
+            cv2.addWeighted(overlay, 0.06, frame, 0.94, 0, frame)
 
-            for box, obj_id, cls in zip(boxes, ids, clss):
-                x1, y1, x2, y2 = map(int, box)
-                cx_orig = (x1 + x2) / 2
-                cy_orig = (y1 + y2) / 2
+            if results[0].boxes.id is not None:
+                boxes = results[0].boxes.xyxy.cpu().numpy()
+                ids   = results[0].boxes.id.cpu().numpy().astype(int)
+                clss  = results[0].boxes.cls.cpu().numpy().astype(int)
 
-                if has_homography:
-                    wcx, wcy = project_point((cx_orig, cy_orig), H)
-                else:
-                    wcx, wcy = cx_orig, cy_orig
+                for box, obj_id, cls in zip(boxes, ids, clss):
+                    x1, y1, x2, y2 = map(int, box)
+                    cx_orig = (x1 + x2) / 2
+                    cy_orig = (y1 + y2) / 2
 
-                sA = side_of_line(wcx, wcy, line_A)
-                sB = side_of_line(wcx, wcy, line_B)
-                in_zone = in_roi_warped(wcy)
+                    if has_homography:
+                        wcx, wcy = project_point((cx_orig, cy_orig), H)
+                    else:
+                        wcx, wcy = cx_orig, cy_orig
 
-                if in_zone:
-                    since_last = t - last_cross_time.get(obj_id, -999)
+                    sA      = side_of_line(wcx, wcy, line_A)
+                    sB      = side_of_line(wcx, wcy, line_B)
+                    in_zone = in_roi_warped(wcy)
 
-                    if obj_id not in first_cross_time:
-                        crossed_A = obj_id in prev_side_A and prev_side_A[obj_id] != sA
-                        crossed_B = obj_id in prev_side_B and prev_side_B[obj_id] != sB
-                        if (crossed_A or crossed_B) and since_last >= CROSS_COOLDOWN:
-                            first_cross_time[obj_id] = t
-                            first_cross_line[obj_id] = 'A' if crossed_A else 'B'
-                            last_cross_time[obj_id]  = t
+                    # ── Crossing / speed logic ────────────────────────────────
+                    if in_zone:
+                        since_last = t - last_cross_time.get(obj_id, -999)
 
-                    elif obj_id not in second_cross_time:
-                        other_prev  = prev_side_B if first_cross_line[obj_id] == 'A' else prev_side_A
-                        other_curr  = sB          if first_cross_line[obj_id] == 'A' else sA
-                        other_label = 'B'         if first_cross_line[obj_id] == 'A' else 'A'
+                        if obj_id not in first_cross_time:
+                            crossed_A = obj_id in prev_side_A and prev_side_A[obj_id] != sA
+                            crossed_B = obj_id in prev_side_B and prev_side_B[obj_id] != sB
+                            if (crossed_A or crossed_B) and since_last >= CROSS_COOLDOWN:
+                                first_cross_time[obj_id] = t
+                                first_cross_line[obj_id] = 'A' if crossed_A else 'B'
+                                last_cross_time[obj_id]  = t
+                                # ← KEY CHANGE: flip to 'measuring' on first crossing
+                                measure_state[obj_id]    = 'measuring'
 
-                        crossed_second = (
-                            obj_id in other_prev
-                            and other_prev[obj_id] != other_curr
-                            and since_last >= CROSS_COOLDOWN
-                        )
+                        elif obj_id not in second_cross_time:
+                            other_prev  = prev_side_B if first_cross_line[obj_id] == 'A' else prev_side_A
+                            other_curr  = sB          if first_cross_line[obj_id] == 'A' else sA
+                            other_label = 'B'         if first_cross_line[obj_id] == 'A' else 'A'
 
-                        if crossed_second:
-                            dt = t - first_cross_time[obj_id]
+                            crossed_second = (
+                                obj_id in other_prev
+                                and other_prev[obj_id] != other_curr
+                                and since_last >= CROSS_COOLDOWN
+                            )
 
-                            if MIN_TRAVEL_TIME <= dt <= MAX_TRAVEL_TIME:
-                                raw_spd = (real_distance / dt) * 3.6
-                                if raw_spd <= MAX_SPEED_KMH:
-                                    prev_spd = speeds.get(obj_id, raw_spd)
-                                    smoothed = EMA_ALPHA * raw_spd + (1 - EMA_ALPHA) * prev_spd
-                                    speeds[obj_id]            = smoothed
-                                    second_cross_time[obj_id] = t
-                                    last_cross_time[obj_id]   = t
+                            if crossed_second:
+                                dt = t - first_cross_time[obj_id]
 
-                                    log_data.append({
-                                        "ID":           obj_id,
-                                        "Class":        model.names[cls],
-                                        "EntryLine":    first_cross_line[obj_id],
-                                        "EntryTime":    round(first_cross_time[obj_id], 3),
-                                        "ExitLine":     other_label,
-                                        "ExitTime":     round(t, 3),
-                                        "Duration_s":   round(dt, 3),
-                                        "Speed_kmh":    round(smoothed, 2),
-                                        "RawSpeed_kmh": round(raw_spd, 2),
-                                    })
+                                if MIN_TRAVEL_TIME <= dt <= MAX_TRAVEL_TIME:
+                                    raw_spd = (real_distance / dt) * 3.6
+                                    if raw_spd <= MAX_SPEED_KMH:
+                                        prev_spd = speeds.get(obj_id, raw_spd)
+                                        smoothed = EMA_ALPHA * raw_spd + (1 - EMA_ALPHA) * prev_spd
+                                        speeds[obj_id]            = smoothed
+                                        # ← KEY CHANGE: flip to 'done' immediately
+                                        measure_state[obj_id]     = 'done'
+                                        second_cross_time[obj_id] = t
+                                        last_cross_time[obj_id]   = t
 
+                                        log_data.append({
+                                            "ID":           obj_id,
+                                            "Class":        model.names[cls],
+                                            "EntryLine":    first_cross_line[obj_id],
+                                            "EntryTime":    round(first_cross_time[obj_id], 3),
+                                            "ExitLine":     other_label,
+                                            "ExitTime":     round(t, 3),
+                                            "Duration_s":   round(dt, 3),
+                                            "Speed_kmh":    round(smoothed, 2),
+                                            "RawSpeed_kmh": round(raw_spd, 2),
+                                        })
+
+                                        first_cross_time.pop(obj_id, None)
+                                        first_cross_line.pop(obj_id, None)
+                                        second_cross_time.pop(obj_id, None)
+
+                                elif dt > MAX_TRAVEL_TIME:
                                     first_cross_time.pop(obj_id, None)
                                     first_cross_line.pop(obj_id, None)
-                                    second_cross_time.pop(obj_id, None)
+                                    measure_state[obj_id] = 'none'
 
-                            elif dt > MAX_TRAVEL_TIME:
-                                first_cross_time.pop(obj_id, None)
-                                first_cross_line.pop(obj_id, None)
+                    prev_side_A[obj_id] = sA
+                    prev_side_B[obj_id] = sB
 
-                prev_side_A[obj_id] = sA
-                prev_side_B[obj_id] = sB
+                    # ── Drawing ───────────────────────────────────────────────
+                    # Vehicles OUTSIDE the ROI: thin grey box, no label
+                    if not in_zone:
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (70, 70, 70), 1)
+                        continue
 
-                box_color = (0, 255, 0) if in_zone else (0, 200, 255)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-                if obj_id in speeds:
-                    draw_label(frame, x1, y1,
-                               f"ID {obj_id} | {speeds[obj_id]:.1f} km/h", (0, 255, 0))
-                else:
-                    draw_label(frame, x1, y1, f"ID {obj_id}", (200, 200, 200))
+                    # Vehicles INSIDE the ROI — label depends on state
+                    state = measure_state.get(obj_id, 'none')
 
-        cv2.line(frame, line_A_orig[0], line_A_orig[1], (0, 255, 255), 2)
-        cv2.line(frame, line_B_orig[0], line_B_orig[1], (0, 255, 255), 2)
-        cv2.putText(frame, "A", (line_A_orig[0][0] - 20, line_A_orig[0][1]),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.putText(frame, "B", (line_B_orig[0][0] - 20, line_B_orig[0][1]),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    if state == 'done':
+                        # ── Confirmed speed ──────────────────────────────────
+                        box_color  = (0, 255, 0)          # green
+                        label_text = f"ID {obj_id} | {speeds[obj_id]:.1f} km/h"
+                        lbl_color  = (0, 255, 0)
+                        bg_color   = (0, 50, 0)
 
-        writer.write(frame)
-        frame_count += 1
-        update(processed_frames=frame_count)
+                    elif state == 'measuring':
+                        # ── Crossed first line, waiting for second ───────────
+                        box_color = (0, 200, 255)          # cyan
+                        if obj_id in speeds:
+                            # Re-entry: show previous speed while re-measuring
+                            label_text = f"ID {obj_id} | {speeds[obj_id]:.1f} km/h"
+                        else:
+                            # Very first crossing for this vehicle
+                            label_text = f"ID {obj_id} | Measuring..."
+                        lbl_color = (0, 200, 255)
+                        bg_color  = (0, 40, 55)
+
+                    else:
+                        # ── Inside ROI but not yet crossed any line ──────────
+                        # Subtle green outline only — no label clutter
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 180, 100), 1)
+                        continue
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+                    draw_label(frame, x1, y1, label_text, lbl_color, bg_color)
+
+            # ── Measurement lines ─────────────────────────────────────────────
+            cv2.line(frame, line_A_orig[0], line_A_orig[1], (0, 255, 255), 2)
+            cv2.line(frame, line_B_orig[0], line_B_orig[1], (0, 255, 255), 2)
+            cv2.putText(frame, "A", (line_A_orig[0][0] - 20, line_A_orig[0][1]),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(frame, "B", (line_B_orig[0][0] - 20, line_B_orig[0][1]),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+            writer.write(frame)
+            frame_count += 1
+            update(processed_frames=frame_count)
+
+    except Exception as exc:
+        err_msg = f"Frame {frame_count}: {type(exc).__name__}: {exc}"
+        print(f"[ERROR] Processing crashed — {err_msg}")
+        cap.release()
+        writer.release()
+        update("error", error=err_msg)
+        return None
 
     cap.release()
     writer.release()
 
-    # ── If we used mp4v, re-encode to H.264 via ffmpeg ────────────────────────
     if used_codec == 'mp4v':
         update("finalizing")
         reencode_h264(mp4_path)
@@ -376,7 +462,6 @@ def run_headless_roi(video_path, run_id=None, save_dir="outputs_roi", progress_s
         csv_path = f"{run_dir}/log.csv"
         df.to_csv(csv_path, index=False)
 
-        # ── Per-vehicle speed bar chart ───────────────────────────────────────
         graph_path = f"{run_dir}/speed_graph.png"
         n   = len(df)
         fig, ax = plt.subplots(figsize=(max(8, n * 0.9), 5), facecolor="#0d1117")
